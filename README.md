@@ -14,6 +14,7 @@
 <p align="center">
   <a href="#quick-start">Quick Start</a> ·
   <a href="#gbm-workflow">GBM Workflow</a> ·
+  <a href="#evaluation">Evaluation</a> ·
   <a href="#configuration">Configuration</a> ·
   <a href="#citation">Citation</a>
 </p>
@@ -32,6 +33,7 @@
 - **Review MRI together.** Linked axial, coronal and sagittal views, side-by-side comparisons, per-panel sequence selection and hold-to-hide masks.
 - **Track change across visits.** Segmentation-derived volumes, QC warnings and rigid alignment to a chosen reference visit. Unmeasured visits are never plotted as zero.
 - **Draft for human review.** Findings and impression stay separate from QC and provenance. LLM report requests contain only allowlisted, de-identified measurements and QC fields, never images, dates or identifiers.
+- **Bring the model to the data.** Works with self-hosted models through any OpenAI-compatible endpoint. With Muse-Glimmer-30B, ClinAgent GBM completed all 65 cases of a public glioblastoma evaluation, and every reported volume matched the tool measurements ([details](#evaluation)).
 
 ## Quick Start
 
@@ -83,6 +85,22 @@ flowchart LR
 ```
 
 Upload NIfTI files, folders or ZIP archives and confirm the modality mapping. Timelines use confirmed scan dates or explicit relative days. Alignment supports comparison across visits; native segmentation volumes remain the report source.
+
+## Evaluation
+
+We tested whether a language model running inside ClinAgent GBM can complete the longitudinal workflow on public data. The cohort is 65 glioblastoma patients from [LUMIERE](https://doi.org/10.1038/s41597-022-01881-7), each with two MRI visits of T1, T1c, T2 and FLAIR. For every patient, the model had to request new segmentations for both visits, review their QC results, compare three tumor regions and submit a structured report. No precomputed answers were provided. All models used the same harness, segmentation model, inputs and scoring rules.
+
+| Model | Task success | Numeric fidelity | Mean / P95 time (s) |
+| --- | --- | --- | --- |
+| **Muse-Glimmer-30B** | **65/65 (100%)** | **780/780 (100%)** | **14.9 / 21.2** |
+| gpt-5.6-luna | 65/65 (100%) | 780/780 (100%) | 16.8 / 19.2 |
+| gemma4-v2-Q4_K_M | 61/65 (93.8%) | 743/780 (95.3%) | 16.1 / 18.8 |
+
+- **Task success.** Both segmentations obtained, passing QC reviewed, and a complete three-region report with correct values, directions and measurement sources. One round of formatting feedback is allowed.
+- **Numeric fidelity.** 65 patients × 3 regions × 4 values (prior volume, follow-up volume, change, percent change), checked against volumes computed independently from the masks generated in each run.
+- **Time.** The full workflow from task start to final report, including segmentation. Serving hardware and sampling differed across models, so times are indicative.
+
+This is an early study on a development cohort. One additional patient was excluded after review because both segmentations were empty for every model. The benchmark measures tool use, evidence transfer and report completion; segmentation accuracy and clinical interpretation need separate reference standards.
 
 ## Architecture
 
