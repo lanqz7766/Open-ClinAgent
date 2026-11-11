@@ -1,0 +1,758 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ClinAgent Console</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <script src="https://cdn.jsdelivr.net/npm/@niivue/niivue@0.67.0/dist/niivue.umd.js" defer></script>
+    <link rel="stylesheet" href="/demo-assets/styles.css?v=20260325f" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-lockup">
+          <button class="brand-button" data-open-module="home" type="button">
+            <span class="brand-mark">A</span>
+            <span class="brand-copy">
+              <strong>AI Agent</strong>
+              <small>ClinAgent Platform</small>
+            </span>
+          </button>
+        </div>
+
+        <nav class="app-nav" aria-label="Primary navigation">
+          <button class="nav-link active" data-nav-module="home" data-open-module="home" type="button">Home</button>
+          <button class="nav-link" data-nav-module="dashboard" data-open-module="dashboard" type="button">Dashboard</button>
+          <button class="nav-link" data-nav-module="workflows" data-open-module="workflows" type="button">Workflows</button>
+          <button class="nav-link" data-nav-module="activities" data-open-module="activities" type="button">Activities</button>
+          <button class="nav-link" data-nav-module="functions" data-open-module="functions" type="button">Functions</button>
+          <button class="nav-link" data-nav-module="analysis" data-open-module="analysis" type="button">Analysis</button>
+        </nav>
+      </header>
+
+      <main class="page-stack">
+        <section class="page-panel active" data-page-panel="home">
+          <section class="platform-page home-page">
+            <div class="page-heading hero-heading">
+              <div class="home-mark">✦</div>
+              <p class="eyebrow page-kicker">General Clinical Command</p>
+              <h1>AI Agent Platform</h1>
+              <p id="page-subtitle" class="page-lead">
+                Your intelligent assistant for workflows, activities, and analysis. Ask me anything to get started.
+              </p>
+            </div>
+
+            <section class="feature-grid">
+              <article class="feature-card">
+                <div class="feature-icon blue">W</div>
+                <h3>Smart Workflows</h3>
+                <p>Automate and streamline your processes with intelligent workflow management.</p>
+              </article>
+              <article class="feature-card">
+                <div class="feature-icon purple">A</div>
+                <h3>Activity Tracking</h3>
+                <p>Monitor and analyze all activities in real-time with comprehensive insights.</p>
+              </article>
+              <article class="feature-card">
+                <div class="feature-icon indigo">F</div>
+                <h3>Powerful Functions</h3>
+                <p>Access a suite of focused functions to support clinical productivity and review.</p>
+              </article>
+            </section>
+
+            <article class="chat-shell">
+              <div class="chat-shell-header">
+                <div class="chat-shell-avatar">A</div>
+                <div>
+                  <strong>AI Agent</strong>
+                  <p>Always here to help</p>
+                </div>
+              </div>
+              <div id="command-prompts" class="prompt-row"></div>
+              <div id="home-chat-log" class="chat-log landing-chat"></div>
+              <div id="router-card" class="router-card"></div>
+              <form id="command-form" class="composer">
+                <div class="composer-field modern-composer">
+                  <textarea
+                    id="command-input"
+                    rows="2"
+                    placeholder="Ask me about workflows, activities, analysis, or a specific clinical task..."
+                  ></textarea>
+                  <button class="primary-button composer-send" type="submit">Send</button>
+                </div>
+              </form>
+            </article>
+          </section>
+        </section>
+
+        <section class="page-panel" data-page-panel="dashboard">
+          <section class="platform-page dashboard-page">
+            <div class="page-heading page-header-row">
+              <div>
+                <h1>Dashboard</h1>
+                <p class="page-lead">Overview of your platform metrics and activities</p>
+              </div>
+            </div>
+
+            <div id="dashboard-stats" class="stats-grid"></div>
+
+            <div class="two-column-grid">
+              <article class="surface-card">
+                <div class="card-header">
+                  <h3>Activity Timeline</h3>
+                </div>
+                <div id="dashboard-activity" class="activity-timeline"></div>
+              </article>
+
+              <article class="surface-card">
+                <div class="card-header">
+                  <h3>Quick Stats</h3>
+                </div>
+                <div id="dashboard-quickstats" class="progress-stack"></div>
+              </article>
+            </div>
+          </section>
+        </section>
+
+        <section class="page-panel" data-page-panel="workflows">
+          <section class="platform-page workflows-page">
+            <div class="page-heading page-header-row">
+              <div>
+                <h1>Workflows</h1>
+                <p class="page-lead">Manage and monitor your automated workflows</p>
+              </div>
+              <button class="primary-button" type="button">New Workflow</button>
+            </div>
+
+            <div id="workflow-grid" class="workflow-list"></div>
+
+            <section class="section-stack">
+              <div class="card-header section-title">
+                <h2>Workflow Templates</h2>
+              </div>
+              <div id="landing-workflow-cards" class="template-grid"></div>
+            </section>
+          </section>
+        </section>
+
+        <section class="page-panel" data-page-panel="activities">
+          <section class="platform-page activities-page">
+            <div class="page-heading page-header-row">
+              <div>
+                <h1>Activities</h1>
+                <p class="page-lead">Track and monitor all platform activities</p>
+              </div>
+              <div class="page-actions">
+                <button class="ghost-button" type="button">Filter</button>
+                <button class="ghost-button" type="button">Export</button>
+              </div>
+            </div>
+
+            <div id="activities-stats" class="stats-grid"></div>
+
+            <article class="surface-card">
+              <div class="card-header">
+                <h3>Recent Activities</h3>
+              </div>
+              <div id="activities-list" class="activity-feed"></div>
+            </article>
+          </section>
+        </section>
+
+        <section class="page-panel" data-page-panel="functions">
+          <section class="platform-page functions-page">
+            <div class="page-heading page-header-row">
+              <div>
+                <h1>Functions</h1>
+                <p class="page-lead">Powerful functions to enhance your workflows</p>
+              </div>
+              <button class="primary-button" type="button">Create Function</button>
+            </div>
+
+            <div id="functions-categories" class="category-row"></div>
+            <div id="functions-grid" class="function-grid"></div>
+          </section>
+        </section>
+
+        <section class="page-panel" data-page-panel="analysis">
+          <section class="platform-page analysis-page">
+            <div class="page-heading page-header-row">
+              <div>
+                <h1>Analysis</h1>
+                <p class="page-lead">Deep insights and analytics for your platform</p>
+              </div>
+              <button class="ghost-button" type="button">Export Report</button>
+            </div>
+
+            <div id="analysis-metrics" class="stats-grid"></div>
+
+            <div class="two-column-grid">
+              <article class="surface-card">
+                <div class="card-header">
+                  <h3>Performance Over Time</h3>
+                </div>
+                <div class="chart-placeholder blue-tint">Chart visualization placeholder</div>
+              </article>
+
+              <article class="surface-card">
+                <div class="card-header">
+                  <h3>Usage by Category</h3>
+                </div>
+                <div class="chart-placeholder purple-tint">Chart visualization placeholder</div>
+              </article>
+            </div>
+
+            <article class="surface-card">
+              <div class="card-header">
+                <h3>Detailed Breakdown</h3>
+              </div>
+              <div id="analysis-breakdown" class="progress-stack"></div>
+            </article>
+
+            <div id="analysis-insights" class="insight-grid"></div>
+          </section>
+        </section>
+
+        <section class="page-panel" data-page-panel="findings">
+          <section class="module-page">
+            <header class="module-page-header">
+              <div>
+                <p class="eyebrow">Findings Closure</p>
+                <h2 id="findings-title">Loading case...</h2>
+                <p id="findings-summary" class="support-copy"></p>
+                <div id="findings-meta" class="meta-row chips"></div>
+              </div>
+              <div class="module-header-side">
+                <span id="findings-risk-badge" class="risk-badge">Alert</span>
+                <a class="ghost-button" href="/findings-demo" target="_blank" rel="noreferrer">Open full module</a>
+              </div>
+            </header>
+
+            <div class="module-layout">
+              <aside class="module-rail">
+                <section class="card compact">
+                  <p class="section-label">Cases</p>
+                  <div id="findings-case-list" class="case-list"></div>
+                </section>
+              </aside>
+
+              <section class="module-content">
+                <div id="findings-summary-cards" class="summary-cards"></div>
+
+                <div class="grid two-col">
+                  <article class="card">
+                    <div class="panel-heading">
+                      <div>
+                        <p class="section-label">Signal</p>
+                        <h3>Current focus metric</h3>
+                      </div>
+                    </div>
+                    <p id="findings-focus" class="hero-summary report-summary"></p>
+                    <div id="findings-actions" class="report-sections"></div>
+                  </article>
+
+                  <article class="card">
+                    <div class="panel-heading">
+                      <div>
+                        <p class="section-label">Closure</p>
+                        <h3>Recommended next step</h3>
+                      </div>
+                    </div>
+                    <p id="findings-rationale" class="support-copy"></p>
+                    <div id="findings-evidence" class="field-grid"></div>
+                  </article>
+                </div>
+              </section>
+            </div>
+          </section>
+        </section>
+
+        <section class="page-panel" data-page-panel="queue">
+          <section class="module-page">
+            <header class="module-page-header">
+              <div>
+                <p class="eyebrow">Queue Triage</p>
+                <h2 id="queue-title">Loading case...</h2>
+                <p id="queue-subtitle" class="support-copy"></p>
+                <div id="queue-meta" class="meta-row chips"></div>
+              </div>
+              <div class="module-header-side">
+                <span id="queue-risk-badge" class="risk-badge">Alert</span>
+                <a class="ghost-button" href="/queue-demo" target="_blank" rel="noreferrer">Open full module</a>
+              </div>
+            </header>
+
+            <div class="module-layout">
+              <aside class="module-rail">
+                <section class="card compact">
+                  <p class="section-label">Cases</p>
+                  <div id="queue-case-list" class="case-list"></div>
+                </section>
+              </aside>
+
+              <section class="module-content">
+                <div id="queue-summary-cards" class="summary-cards"></div>
+
+                <div class="grid two-col">
+                  <article class="card">
+                    <div class="panel-heading">
+                      <div>
+                        <p class="section-label">Signal</p>
+                        <h3>Priority and urgency</h3>
+                      </div>
+                    </div>
+                    <p id="queue-focus" class="hero-summary report-summary"></p>
+                    <div id="queue-actions" class="report-sections"></div>
+                  </article>
+
+                  <article class="card">
+                    <div class="panel-heading">
+                      <div>
+                        <p class="section-label">Queue move</p>
+                        <h3>Recommended disposition</h3>
+                      </div>
+                    </div>
+                    <p id="queue-rationale" class="support-copy"></p>
+                    <div id="queue-evidence" class="field-grid"></div>
+                  </article>
+                </div>
+              </section>
+            </div>
+          </section>
+        </section>
+
+        <section class="page-panel" data-page-panel="diagnosis">
+          <section class="module-page">
+            <header class="module-page-header">
+              <div>
+                <p class="eyebrow">Missed Diagnosis Review</p>
+                <h2 id="diagnosis-title">Loading case...</h2>
+                <p id="diagnosis-subtitle" class="support-copy"></p>
+                <div id="diagnosis-meta" class="meta-row chips"></div>
+              </div>
+              <div class="module-header-side">
+                <span id="diagnosis-risk-badge" class="risk-badge">Alert</span>
+              </div>
+            </header>
+
+            <div class="module-layout">
+              <aside class="module-rail">
+                <section class="card compact">
+                  <p class="section-label">Cases</p>
+                  <div id="diagnosis-case-list" class="case-list"></div>
+                </section>
+              </aside>
+
+              <section class="module-content">
+                <div id="diagnosis-summary-cards" class="summary-cards"></div>
+
+                <div class="grid two-col">
+                  <article class="card">
+                    <div class="panel-heading">
+                      <div>
+                        <p class="section-label">Signal</p>
+                        <h3>Missed diagnosis signal</h3>
+                      </div>
+                    </div>
+                    <p id="diagnosis-focus" class="hero-summary report-summary"></p>
+                    <div id="diagnosis-actions" class="report-sections"></div>
+                  </article>
+
+                  <article class="card">
+                    <div class="panel-heading">
+                      <div>
+                        <p class="section-label">Gap</p>
+                        <h3>Recommended follow-up</h3>
+                      </div>
+                    </div>
+                    <p id="diagnosis-rationale" class="support-copy"></p>
+                    <div id="diagnosis-evidence" class="field-grid"></div>
+                  </article>
+                </div>
+              </section>
+            </div>
+          </section>
+        </section>
+
+        <section class="page-panel" data-page-panel="screening">
+          <section class="module-page">
+            <header class="module-page-header">
+              <div>
+                <p class="eyebrow">Screening Gap Closure</p>
+                <h2 id="screening-title">Loading case...</h2>
+                <p id="screening-subtitle" class="support-copy"></p>
+                <div id="screening-meta" class="meta-row chips"></div>
+              </div>
+              <div class="module-header-side">
+                <span id="screening-risk-badge" class="risk-badge">Alert</span>
+              </div>
+            </header>
+
+            <div class="module-layout">
+              <aside class="module-rail">
+                <section class="card compact">
+                  <p class="section-label">Cases</p>
+                  <div id="screening-case-list" class="case-list"></div>
+                </section>
+              </aside>
+
+              <section class="module-content">
+                <div id="screening-summary-cards" class="summary-cards"></div>
+
+                <div class="grid two-col">
+                  <article class="card">
+                    <div class="panel-heading">
+                      <div>
+                        <p class="section-label">Signal</p>
+                        <h3>Screening gap signal</h3>
+                      </div>
+                    </div>
+                    <p id="screening-focus" class="hero-summary report-summary"></p>
+                    <div id="screening-actions" class="report-sections"></div>
+                  </article>
+
+                  <article class="card">
+                    <div class="panel-heading">
+                      <div>
+                        <p class="section-label">Follow-up</p>
+                        <h3>Recommended next step</h3>
+                      </div>
+                    </div>
+                    <p id="screening-rationale" class="support-copy"></p>
+                    <div id="screening-evidence" class="field-grid"></div>
+                  </article>
+                </div>
+              </section>
+            </div>
+          </section>
+        </section>
+
+        <section class="page-panel" data-page-panel="neuro">
+          <section class="module-page neuro-module">
+            <header class="module-page-header neuro-header">
+              <div>
+                <p class="eyebrow">Neuro Longitudinal Review</p>
+                <h2 id="patient-name">Loading...</h2>
+                <p id="patient-summary" class="support-copy"></p>
+                <div id="patient-meta" class="meta-row chips"></div>
+              </div>
+              <div class="module-header-side neuro-header-side">
+                <label class="neuro-case-picker">
+                  <span class="section-label">Case</span>
+                  <select id="neuro-case-select"></select>
+                </label>
+                <span id="review-badge" class="status-badge">In Review</span>
+                <span id="risk-pill" class="pill pill-risk">High attention</span>
+                <div class="neuro-signal-chip">
+                  <span class="section-label">Signal</span>
+                  <strong id="neuro-signal-number">Longitudinal review</strong>
+                  <small id="neuro-signal-note">Composite burden and interval trend</small>
+                </div>
+              </div>
+            </header>
+
+            <div class="module-layout neuro-layout">
+              <section class="module-content neuro-content">
+                <div id="metric-grid" class="metric-grid"></div>
+
+                <nav class="subnav">
+                  <button class="subnav-item active" data-neuro-view="command" type="button">Command</button>
+                  <button class="subnav-item" data-neuro-view="analysis" type="button">Analysis</button>
+                  <button class="subnav-item" data-neuro-view="review" type="button">Review</button>
+                </nav>
+
+                <section class="subpanel active" data-neuro-panel="command">
+                  <div class="grid two-col">
+                    <article class="card neuro-chat-card">
+                      <div class="panel-heading">
+                        <div>
+                          <p class="section-label">Chat Workspace</p>
+                          <h3>Natural language task entry</h3>
+                        </div>
+                      </div>
+                      <div class="prompt-row">
+                        <button class="prompt-chip neuro-prompt" data-prompt="Draft a longitudinal brain metastasis brief for this case.">Draft brief</button>
+                        <button class="prompt-chip neuro-prompt" data-prompt="Show the latest burden trend and explain the signal.">Show trend</button>
+                        <button class="prompt-chip neuro-prompt" data-prompt="Summarize the follow-up review for a physician reader.">Summarize review</button>
+                      </div>
+                      <div id="chat-log" class="chat-log"></div>
+                      <form id="chat-form" class="chat-form">
+                        <textarea id="chat-input" rows="3" placeholder="Ask for a review brief or trend explanation."></textarea>
+                        <div class="actions-row">
+                          <span class="hint">Controlled neuro workflow, not free-form diagnosis.</span>
+                          <button type="submit" class="primary-button">Send task</button>
+                        </div>
+                      </form>
+                    </article>
+
+                    <article class="card neuro-workflow-card">
+                      <div class="panel-heading">
+                        <div>
+                          <p class="section-label">Workflow</p>
+                          <h3 id="workflow-title">Longitudinal review workflow</h3>
+                        </div>
+                        <span id="workflow-status" class="pill">Ready</span>
+                      </div>
+                      <p id="workflow-objective" class="support-copy"></p>
+                      <div id="workflow-steps" class="workflow-steps"></div>
+                      <div class="divider-line"></div>
+                      <div class="upload-inline">
+                        <p class="section-label">Attachments</p>
+                        <label class="upload-dropzone compact-dropzone" for="file-input">
+                          <input id="file-input" type="file" multiple />
+                          <strong>Attach notes</strong>
+                          <span>Optional local demo input</span>
+                        </label>
+                        <div id="upload-list" class="upload-list"></div>
+                      </div>
+                    </article>
+                  </div>
+                </section>
+
+                <section class="subpanel" data-neuro-panel="analysis">
+                  <div class="neuro-hero-grid">
+                    <article class="card neuro-signal-card">
+                      <div class="panel-heading">
+                        <div>
+                          <p class="section-label">Signal</p>
+                          <h3>Composite burden and trend</h3>
+                        </div>
+                      </div>
+                      <div id="attention-banner" class="attention-banner"></div>
+                      <div class="signal-strip">
+                        <div class="signal-chip">
+                          <span>Baseline</span>
+                          <strong id="neuro-baseline-value">-</strong>
+                        </div>
+                        <div class="signal-chip">
+                          <span>Latest</span>
+                          <strong id="neuro-latest-value">-</strong>
+                        </div>
+                      </div>
+                      <p id="neuro-recent-note" class="support-copy compact-note"></p>
+                    </article>
+
+                    <article class="card neuro-chart-card">
+                      <div class="chart-header">
+                        <div>
+                          <p class="section-label">Trend</p>
+                          <h3>Composite burden vs time</h3>
+                        </div>
+                        <span class="chart-legend">
+                          <i class="legend-dot legend-blue"></i> Composite burden
+                        </span>
+                      </div>
+                      <svg id="trend-chart" class="trend-chart" viewBox="0 0 560 240" aria-label="Longitudinal burden chart"></svg>
+                      <div id="timeline" class="timeline-bar"></div>
+                    </article>
+                  </div>
+
+                  <div class="grid two-col neuro-analysis-grid">
+                    <article class="card neuro-preview-card">
+                      <div class="panel-heading">
+                        <div>
+                          <p class="section-label">NiiVue Viewer</p>
+                          <h3>Representative slice and overlay</h3>
+                        </div>
+                        <span class="pill viewer-pill">Web viewer</span>
+                      </div>
+                      <div class="viewer-toolbar">
+                        <label class="viewer-select">
+                          <span>Timepoint</span>
+                          <select id="neuro-viewer-timepoint-select"></select>
+                        </label>
+                        <span id="neuro-viewer-status" class="viewer-status">Loading viewer</span>
+                      </div>
+                      <div class="viewer-stage">
+                        <canvas id="neuro-viewer-canvas" class="viewer-canvas"></canvas>
+                        <img id="preview-image" class="preview-image viewer-fallback" src="" alt="Representative follow-up MRI with lesion overlay" />
+                      </div>
+                      <p id="preview-caption" class="support-copy"></p>
+                    </article>
+
+                    <article class="card neuro-report-card">
+                      <div class="panel-heading">
+                        <div>
+                          <p class="section-label">Physician Brief</p>
+                          <h3 id="report-title">Longitudinal review brief</h3>
+                        </div>
+                      </div>
+                      <p id="report-summary" class="hero-summary report-summary"></p>
+                      <div id="report-rendered" class="report-rendered"></div>
+                      <div id="report-sections" class="report-sections"></div>
+                      <p id="report-footnote" class="support-copy compact-note"></p>
+                    </article>
+                  </div>
+                </section>
+
+                <section class="subpanel" data-neuro-panel="review">
+                  <div class="grid two-col">
+                    <article class="card">
+                      <div class="panel-heading">
+                        <div>
+                          <p class="section-label">Reviewer Actions</p>
+                          <h3>Approve, reject, comment</h3>
+                        </div>
+                      </div>
+                      <textarea id="review-comment" rows="4" placeholder="Add reviewer feedback"></textarea>
+                      <div class="actions-row">
+                        <button class="ghost-button" data-review-action="comment" type="button">Save comment</button>
+                        <button class="ghost-button warning" data-review-action="reject" type="button">Reject</button>
+                        <button class="primary-button" data-review-action="approve" type="button">Approve</button>
+                      </div>
+                      <div id="review-history" class="review-history"></div>
+                    </article>
+
+                    <article class="card">
+                      <div class="panel-heading">
+                        <div>
+                          <p class="section-label">Trace</p>
+                          <h3>Recent audit</h3>
+                        </div>
+                      </div>
+                      <div id="audit-list" class="audit-list"></div>
+                    </article>
+                  </div>
+                </section>
+              </section>
+            </div>
+          </section>
+        </section>
+
+        <section class="page-panel" data-page-panel="safety">
+          <section class="module-page">
+            <header class="module-page-header">
+              <div>
+                <p class="eyebrow">Radiation Safety Monitor</p>
+                <h2 id="safety-case-title">Loading case...</h2>
+                <p id="safety-case-subtitle" class="support-copy"></p>
+                <div id="safety-case-meta" class="meta-row chips"></div>
+              </div>
+              <div class="module-header-side">
+                <span id="safety-risk-badge" class="risk-badge">Watch</span>
+                <span id="safety-review-badge" class="status-badge">Open</span>
+              </div>
+            </header>
+
+            <div class="module-layout">
+              <aside class="module-rail">
+                <section class="card compact">
+                  <p class="section-label">Queue</p>
+                  <div id="queue-summary" class="queue-summary"></div>
+                  <div id="safety-case-list" class="case-list"></div>
+                </section>
+              </aside>
+
+              <section class="module-content">
+                <div id="safety-summary-cards" class="summary-cards"></div>
+
+                <nav class="subnav">
+                  <button class="subnav-item active" data-safety-view="overview" type="button">Overview</button>
+                  <button class="subnav-item" data-safety-view="evidence" type="button">Evidence</button>
+                  <button class="subnav-item" data-safety-view="review" type="button">Review</button>
+                </nav>
+
+                <section class="subpanel active" data-safety-panel="overview">
+                  <div class="grid two-col">
+                    <article class="card">
+                      <div class="panel-heading">
+                        <div>
+                          <p class="section-label">Intake</p>
+                          <h3>Incoming case</h3>
+                        </div>
+                      </div>
+                      <div id="intake-fields" class="field-grid"></div>
+                      <div class="text-card">
+                        <p class="section-label">Submitted narrative</p>
+                        <p id="case-text"></p>
+                      </div>
+                      <div id="timeline-list" class="timeline-list"></div>
+                    </article>
+
+                    <article class="card">
+                      <div class="panel-heading">
+                        <div>
+                          <p class="section-label">Top match</p>
+                          <h3 id="top-match-title">Top failure mode</h3>
+                        </div>
+                      </div>
+                      <div id="risk-summary" class="attention-card"></div>
+                      <div id="top-match-details" class="match-detail"></div>
+                    </article>
+                  </div>
+                </section>
+
+                <section class="subpanel" data-safety-panel="evidence">
+                  <div class="grid two-col">
+                    <article class="card">
+                      <div class="panel-heading">
+                        <div>
+                          <p class="section-label">Historical evidence</p>
+                          <h3>Matched patterns</h3>
+                        </div>
+                      </div>
+                      <div id="match-list" class="match-list"></div>
+                    </article>
+
+                    <article class="card">
+                      <div class="panel-heading">
+                        <div>
+                          <p class="section-label">Mitigation</p>
+                          <h3>Playbook and prompts</h3>
+                        </div>
+                      </div>
+                      <div id="recommended-checks" class="check-list"></div>
+                      <div id="review-questions" class="question-list"></div>
+                      <div id="email-card" class="email-card"></div>
+                      <div class="actions-row spaced-top">
+                        <button id="rerun-button" class="ghost-button" type="button">Rerun matcher</button>
+                      </div>
+                    </article>
+                  </div>
+                </section>
+
+                <section class="subpanel" data-safety-panel="review">
+                  <div class="grid two-col">
+                    <article class="card">
+                      <div class="panel-heading">
+                        <div>
+                          <p class="section-label">Reviewer Actions</p>
+                          <h3>Acknowledge, approve, reject</h3>
+                        </div>
+                      </div>
+                      <textarea id="safety-review-comment" rows="4" placeholder="Add QA reviewer context"></textarea>
+                      <div class="actions-row">
+                        <button class="ghost-button" data-safety-review-action="watch" type="button">Mark watch</button>
+                        <button class="ghost-button" data-safety-review-action="approve" type="button">Approve</button>
+                        <button class="primary-button danger" data-safety-review-action="reject" type="button">Reject</button>
+                      </div>
+                      <div id="review-history-safety" class="review-history"></div>
+                    </article>
+
+                    <article class="card">
+                      <div class="panel-heading">
+                        <div>
+                          <p class="section-label">Audit</p>
+                          <h3>Recent trace</h3>
+                        </div>
+                      </div>
+                      <div id="audit-list-safety" class="audit-list"></div>
+                    </article>
+                  </div>
+                </section>
+              </section>
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <script src="/demo-assets/app.js?v=20260325f" defer></script>
+  </body>
+</html>

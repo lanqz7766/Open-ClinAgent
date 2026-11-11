@@ -1,0 +1,6 @@
+**
+!deploy/
+!deploy/Dockerfile
+!deploy/entrypoint.sh
+!dist/
+!dist/*.whl

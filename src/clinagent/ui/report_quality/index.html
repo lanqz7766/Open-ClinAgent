@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ClinAgent Report Quality</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/report-quality-assets/styles.css?v=2" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="rail">
+        <div class="brand-card">
+          <p class="eyebrow">ClinAgent</p>
+          <h1>Report Quality</h1>
+          <p>Local demo for absorbed template, privacy, terminology, and compliance checks.</p>
+        </div>
+
+        <article class="card current-case-card">
+          <div class="panel-heading compact">
+            <div>
+              <p class="section-label">Current case</p>
+              <h3 id="rail-case-title">Loading case...</h3>
+            </div>
+            <span id="rail-status-chip" class="status-chip">Review</span>
+          </div>
+          <p id="rail-case-summary" class="support-copy small-copy"></p>
+          <label class="small-label" for="case-select">Switch sample</label>
+          <select id="case-select" class="case-select"></select>
+        </article>
+
+        <article class="card note-card">
+          <div class="panel-heading compact">
+            <div>
+              <p class="section-label">What this shows</p>
+              <h3>Absorbed skill effect</h3>
+            </div>
+          </div>
+          <p class="support-copy small-copy">
+            The page renders a clinician-facing report on the right and a compact QA board on the left, so you can see what the absorbed
+            `clinical-reports` logic catches before sharing or signing.
+          </p>
+        </article>
+      </aside>
+
+      <main class="workspace">
+        <header class="hero">
+          <div class="hero-copy">
+            <p class="eyebrow">Workflow Demo</p>
+            <h2 id="case-title">Loading case...</h2>
+            <p id="case-subtitle" class="support-copy"></p>
+            <div class="meta-row">
+              <span class="meta-chip" id="focus-chip">Focus</span>
+              <span class="meta-chip">Report QA</span>
+              <span class="meta-chip">Local demo</span>
+            </div>
+          </div>
+          <div class="hero-side">
+            <div class="signal-score" id="signal-score">60</div>
+            <span class="status-chip" id="hero-status-chip">Review</span>
+          </div>
+        </header>
+
+        <section class="summary-strip" id="summary-strip"></section>
+
+        <div class="content-grid">
+          <section class="report-column">
+            <article class="card">
+              <div class="panel-heading">
+                <div>
+                  <p class="section-label">Rendered output</p>
+                  <h3>Clinician-facing report</h3>
+                </div>
+              </div>
+              <div id="report-surface" class="report-surface">Loading report...</div>
+            </article>
+          </section>
+
+          <section class="qa-column">
+            <article class="card">
+              <div class="panel-heading">
+                <div>
+                  <p class="section-label">QA board</p>
+                  <h3>Detected issues</h3>
+                </div>
+              </div>
+              <div id="findings-groups" class="findings-groups"></div>
+            </article>
+
+            <article class="card">
+              <div class="panel-heading">
+                <div>
+                  <p class="section-label">Workflow path</p>
+                  <h3>Validation timeline</h3>
+                </div>
+              </div>
+              <div id="timeline-list" class="timeline-list"></div>
+            </article>
+
+            <article class="card">
+              <div class="panel-heading">
+                <div>
+                  <p class="section-label">Input preview</p>
+                  <h3>Raw sample excerpt</h3>
+                </div>
+              </div>
+              <pre id="input-preview" class="input-preview"></pre>
+            </article>
+          </section>
+        </div>
+      </main>
+    </div>
+    <script src="/report-quality-assets/app.js?v=2" defer></script>
+  </body>
+</html>

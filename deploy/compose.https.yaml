@@ -1,0 +1,24 @@
+# Combine with compose.yaml; gateway stays loopback-only.
+services:
+  ingress:
+    image: nginx:stable-alpine
+    restart: unless-stopped
+    ports:
+      - "${CLINAGENT_HTTPS_BIND_ADDRESS:-0.0.0.0}:${CLINAGENT_HTTPS_PORT:-8443}:8443"
+    volumes:
+      - ./nginx-https.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${CLINAGENT_TLS_CERT:?Set the full-chain certificate file}:/etc/nginx/tls/fullchain.pem:ro
+      - ${CLINAGENT_TLS_KEY:?Set the TLS private-key file}:/etc/nginx/tls/privkey.pem:ro
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+    depends_on:
+      gateway:
+        condition: service_healthy

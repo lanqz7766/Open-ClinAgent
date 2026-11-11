@@ -1,0 +1,28 @@
+family: longitudinal_neuro_review
+title: Longitudinal Neuro Review
+summary: Review serial neuro-imaging studies in temporal context, align treatment events, and generate a concise review-first neuro report.
+pattern:
+  - load longitudinal imaging context
+  - align treatment events to the imaging timeline
+  - summarize interval trend and current signal
+  - generate a clinician-facing brief
+  - run report QA before sign-off
+recommended_skills:
+  - clinical_report_presentation
+  - clinical_report_generator
+  - neuro_report_generator
+  - neuro_report_presenter
+  - neuro_visualization_presenter
+recommended_tools:
+  - dicom_series_selector
+  - brain_met_response_tracker
+  - rt_timeline_aligner
+  - lesion_trend_plotter
+  - longitudinal_comparison_panel_builder
+  - risk_signal_renderer
+initial_workflows:
+  - post_rt_brain_met_longitudinal_review
+future_workflows:
+  - hippocampal_atrophy_longitudinal_review
+  - glioma_post_treatment_response_review
+  - whole_brain_radiotherapy_followup_review

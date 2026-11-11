@@ -1,0 +1,160 @@
+{
+  "id": "post_rt_brain_met_longitudinal_review",
+  "version": "1.1",
+  "title": "Post-Radiotherapy Brain Metastasis Longitudinal Review",
+  "family": "longitudinal_neuro_review",
+  "specialties": ["neuroradiology", "neuro_oncology", "radiation_oncology"],
+  "status": "prototype_ready",
+  "summary": "Align serial brain MRI follow-up after radiotherapy, summarize interval lesion response, and prepare a concise clinician-facing review brief.",
+  "clinical_goal": "Determine whether the treated brain metastasis appears stable, responsive, or concerning across longitudinal MRI follow-up and package the result into a review-ready physician brief.",
+  "problem_statement": "Longitudinal neuro-oncology follow-up often requires manual alignment of serial MRI, treatment timing, and interval response language before a clinician can confidently finalize the review.",
+  "live_test_ready": true,
+  "inputs": [
+    {
+      "name": "longitudinal_series_catalog",
+      "source": "DICOM and NIfTI case bundle",
+      "description": "Serial brain MRI studies with sequence labels, dates, and privacy-preserving derived assets."
+    },
+    {
+      "name": "treatment_timeline",
+      "source": "Radiotherapy event metadata",
+      "description": "Treatment timing used to align response review with the imaging timeline."
+    },
+    {
+      "name": "radiomics_snapshot",
+      "source": "Quantitative follow-up summary",
+      "description": "Derived lesion burden values or equivalent longitudinal response measurements."
+    },
+    {
+      "name": "clinical_context",
+      "source": "Demographic and disease summary",
+      "description": "Compact clinical context such as histology, lesion location, and intervention.",
+      "required": false
+    }
+  ],
+  "routing_hints": {
+    "keywords": [
+      "brain mri",
+      "brain metastasis",
+      "longitudinal review",
+      "post-radiotherapy",
+      "post radiotherapy",
+      "treatment response",
+      "tumor board",
+      "follow-up mri"
+    ],
+    "negative_keywords": [
+      "fit",
+      "colonoscopy",
+      "referral queue",
+      "radiation incident",
+      "lab escalation"
+    ],
+    "sample_queries": [
+      "Review this longitudinal brain MRI follow-up and draft a physician summary.",
+      "Does the latest follow-up suggest treatment response or concerning progression?",
+      "Prepare a concise tumor board brief for this treated brain metastasis case."
+    ]
+  },
+  "trigger_signals": [
+    "serial brain MRI available",
+    "treated brain metastasis follow-up",
+    "post-treatment response assessment",
+    "request for physician brief"
+  ],
+  "evidence_sources": [
+    "longitudinal_mri",
+    "radiotherapy_event",
+    "radiomics_snapshot",
+    "privacy_preserving_viewer_assets"
+  ],
+  "rule_sets": [
+    {
+      "id": "neuro_longitudinal_response_alignment",
+      "summary": "Align treatment timing, longitudinal imaging, and response trend before drafting the clinician-facing brief.",
+      "references": [
+        "serial MRI dates",
+        "treatment event",
+        "derived lesion burden trend"
+      ]
+    },
+    {
+      "id": "review_first_neuro_reporting",
+      "summary": "Prepare a concise draft review and preserve human sign-off whenever the longitudinal signal remains clinically meaningful.",
+      "references": [
+        "risk tier",
+        "evidence board",
+        "report QA gate"
+      ]
+    }
+  ],
+  "actions": [
+    {
+      "id": "review_item",
+      "label": "Create longitudinal review item",
+      "kind": "create_review_item",
+      "description": "Queue the case for clinician sign-off after automated synthesis."
+    },
+    {
+      "id": "chart_summary",
+      "label": "Draft physician brief",
+      "kind": "chart_summary",
+      "description": "Prepare a compact longitudinal neuro-oncology review summary."
+    }
+  ],
+  "output_contract": {
+    "primary_signal": "risk_level",
+    "required_sections": ["signal", "trend", "interpretation", "recommended_next_checks"],
+    "artifacts": ["physician_brief", "comparison_panel", "report_quality_summary"],
+    "review_required": true
+  },
+  "review_policy": {
+    "required": true,
+    "reviewer_role": "clinician",
+    "block_auto_send": true,
+    "block_external_export_if_privacy_fail": true
+  },
+  "tool_policy": {
+    "skills": [
+      "clinical_report_presentation",
+      "clinical_report_generator",
+      "neuro_report_generator",
+      "neuro_report_presenter",
+      "neuro_visualization_presenter"
+    ],
+    "tools": [
+      "dicom_series_selector",
+      "brain_met_response_tracker",
+      "rt_timeline_aligner",
+      "slice_preview_renderer",
+      "lesion_trend_plotter",
+      "treatment_event_timeline_renderer",
+      "key_slice_selector",
+      "overlay_composer",
+      "longitudinal_comparison_panel_builder",
+      "risk_signal_renderer"
+    ],
+    "blocked_tools": ["exec_shell", "raw_file_write"]
+  },
+  "presentation": {
+    "skill": "neuro_report_presenter",
+    "sections": ["Signal", "Trend", "Interpretation", "Recommended Next Checks"],
+    "tone": "compact_longitudinal_neuro"
+  },
+  "examples": [
+    "Compare this treated brain metastasis across serial MRI follow-up and draft a tumor board brief.",
+    "Summarize the treatment-aligned trend and the current concern for this longitudinal MRI case."
+  ],
+  "family_config": {
+    "brief_focus": [
+      "treatment-aligned signal",
+      "interval trend",
+      "comparison context",
+      "review readiness"
+    ],
+    "required_modalities": ["T1C"],
+    "optional_modalities": ["FLAIR", "T1W", "T2W"],
+    "privacy_mode": "defaced_or_focus_crop",
+    "report_template": "radiology"
+  }
+}

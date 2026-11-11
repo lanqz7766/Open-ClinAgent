@@ -1,0 +1,48 @@
+from __future__ import annotations
+
+import os
+from typing import Any, Callable
+
+from clinagent.platform.config import ClinAgentSettings
+from clinagent.platform.models import ScenarioSpec, ToolPolicy
+from clinagent.platform.runtime_bridge import create_agent
+
+
+def llm_ready() -> bool:
+    return any(
+        os.getenv(key)
+        for key in ("OPENAI_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY")
+    )
+
+
+def build_tool_gate(policy: ToolPolicy) -> Callable[[str, dict], bool]:
+    allowed = set(policy.allowed_tools)
+    blocked = set(policy.blocked_tools)
+
+    def gate(tool_name: str, _: dict) -> bool:
+        if allowed and tool_name not in allowed:
+            return False
+        if blocked and tool_name in blocked:
+            return False
+        return True
+
+    return gate
+
+
+def build_agent_for_scenario(
+    settings: ClinAgentSettings,
+    scenario: ScenarioSpec,
+    model: Any | None = None,
+):
+    agent = create_agent(
+        model=model or settings.default_model,
+        instruction=(
+            "You are ClinAgent, a hospital workflow execution assistant. "
+            f"Execute the '{scenario.name}' scenario only. "
+            "Stay inside the allowed tools and return structured, review-ready output."
+        ),
+        streaming=False,
+        max_iterations=scenario.policy.max_iterations,
+    )
+    agent.before_tool = build_tool_gate(scenario.policy)
+    return agent

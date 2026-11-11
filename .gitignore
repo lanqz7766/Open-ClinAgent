@@ -1,0 +1,85 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# ClinAgent runtime
+.clinagent/
+.clawagents/
+.clinicalclaw/
+.private_runtime/
+
+# Environment
+.env
+.env.local
+.env.*
+!.env.example
+.envrc
+
+# Boundary-protected outputs and local data
+reports/
+/outputs/
+archive/tmp/
+archive/README.md
+archive/root-notes/
+archive/docs/CLAUDECODE_PHASE_TRACK.md
+archive/docs/CLINICALCLAW_AGENT_PLATFORM_GUIDELINE.md
+archive/docs/CLINICALCLAW_IMPLEMENTATION_ROADMAP.md
+archive/docs/CLINICALCLAW_PROJECT_PROPOSAL.md
+archive/docs/CLINICAL_WORKFLOW_EXTENSION_TEMPLATE.md
+archive/docs/agent-architecture.md
+archive/docs/changelog.md
+archive/docs/connectors.md
+archive/docs/current-state.md
+archive/docs/data-contracts.md
+archive/docs/dicomweb.md
+archive/docs/environment.md
+archive/docs/neuro-environment.md
+archive/docs/persistence.md
+archive/docs/render-deploy.md
+archive/docs/review-queue.md
+archive/docs/smart-on-fhir.md
+archive/docs/week1.md
+archive/docs/workflow-engine.md
+archive/docs/workflow-families.md
+*.nii
+*.nii.gz
+*.dcm
+*.dicom
+*.nrrd
+*.mha
+*.mhd
+*.raw
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local demo production workspace
+demo-kit/

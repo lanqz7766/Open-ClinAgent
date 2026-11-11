@@ -1,0 +1,315 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/inter";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme {
+  --font-sans: "Inter", system-ui, sans-serif;
+}
+
+@layer base {
+  :root {
+    --background: 34 22% 96%;
+    --foreground: 30 5% 14%;
+    --card: 35 18% 94%;
+    --card-foreground: 30 5% 14%;
+    --popover: 35 18% 94%;
+    --popover-foreground: 30 5% 14%;
+    --primary: 18 62% 52%;
+    --primary-foreground: 40 20% 97%;
+    --secondary: 34 12% 89%;
+    --secondary-foreground: 30 5% 30%;
+    --muted: 34 12% 89%;
+    --muted-foreground: 30 5% 40%;
+    --accent: 34 12% 89%;
+    --accent-foreground: 30 5% 30%;
+    --destructive: 0 60% 50%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 32 12% 82%;
+    --input: 32 12% 82%;
+    --ring: 18 62% 52%;
+    --radius: 0.75rem;
+
+    --status-urgent: 0 70% 55%;
+    --status-alert: 30 80% 55%;
+    --status-watch: 45 70% 50%;
+    --status-ok: 145 50% 42%;
+  }
+
+  .dark {
+    --background: 220 8% 7%;
+    --foreground: 210 9% 90%;
+    --card: 220 7% 10%;
+    --card-foreground: 210 9% 90%;
+    --popover: 220 7% 10%;
+    --popover-foreground: 210 9% 90%;
+    --primary: 16 62% 58%;
+    --primary-foreground: 220 8% 8%;
+    --secondary: 220 6% 15%;
+    --secondary-foreground: 210 7% 76%;
+    --muted: 220 6% 15%;
+    --muted-foreground: 214 6% 60%;
+    --accent: 220 6% 15%;
+    --accent-foreground: 210 7% 76%;
+    --destructive: 0 55% 50%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 6% 20%;
+    --input: 220 6% 20%;
+    --ring: 16 66% 60%;
+  }
+
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  html {
+    font-size: 13px;
+    color-scheme: light;
+    @apply font-sans;
+  }
+
+  html.dark {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply m-0 font-sans antialiased bg-background text-foreground;
+    min-height: 100vh;
+    background-image: linear-gradient(180deg, hsl(var(--background)), hsl(var(--background)));
+  }
+
+  .agent-stage-progress {
+    animation: agent-stage-slide 1.25s ease-in-out infinite;
+    transform: translateX(-120%);
+  }
+
+  @keyframes agent-stage-slide {
+    0% {
+      transform: translateX(-120%);
+    }
+
+    50% {
+      transform: translateX(90%);
+    }
+
+    100% {
+      transform: translateX(220%);
+    }
+  }
+
+  #root {
+    min-height: 100vh;
+  }
+
+  button {
+    @apply font-medium;
+  }
+
+  .prose-clinagent h1,
+  .prose-clinagent h2,
+  .prose-clinagent h3,
+  .prose h1,
+  .prose h2,
+  .prose h3 {
+    color: hsl(var(--foreground));
+    font-weight: 500;
+  }
+
+  .prose-clinagent h1,
+  .prose h1 {
+    font-size: 1rem;
+    margin: 1.25rem 0 0.5rem;
+  }
+
+  .prose-clinagent h2,
+  .prose h2 {
+    font-size: 0.9375rem;
+    margin: 1rem 0 0.375rem;
+  }
+
+  .prose-clinagent h3,
+  .prose h3 {
+    font-size: 0.875rem;
+    margin: 0.875rem 0 0.25rem;
+  }
+
+  .prose-clinagent p,
+  .prose p {
+    margin: 0.25rem 0;
+    line-height: 1.6;
+  }
+
+  .prose-clinagent ol,
+  .prose ol {
+    list-style-type: decimal;
+    padding-left: 1.5rem;
+    margin: 0.5rem 0;
+  }
+
+  .prose-clinagent ul,
+  .prose ul {
+    list-style-type: disc;
+    padding-left: 1.25rem;
+    margin: 0.5rem 0;
+  }
+
+  .prose-clinagent li,
+  .prose li {
+    margin-bottom: 0.375rem;
+  }
+}
+
+@theme inline {
+  --font-heading: var(--font-sans);
+  --font-sans: 'Inter Variable', sans-serif;
+  --color-sidebar-ring: hsl(var(--sidebar-ring));
+  --color-sidebar-border: hsl(var(--sidebar-border));
+  --color-sidebar-accent-foreground: hsl(var(--sidebar-accent-foreground));
+  --color-sidebar-accent: hsl(var(--sidebar-accent));
+  --color-sidebar-primary-foreground: hsl(var(--sidebar-primary-foreground));
+  --color-sidebar-primary: hsl(var(--sidebar-primary));
+  --color-sidebar-foreground: hsl(var(--sidebar-foreground));
+  --color-sidebar: hsl(var(--sidebar));
+  --color-chart-5: hsl(var(--chart-5));
+  --color-chart-4: hsl(var(--chart-4));
+  --color-chart-3: hsl(var(--chart-3));
+  --color-chart-2: hsl(var(--chart-2));
+  --color-chart-1: hsl(var(--chart-1));
+  --color-ring: hsl(var(--ring));
+  --color-input: hsl(var(--input));
+  --color-border: hsl(var(--border));
+  --color-destructive: hsl(var(--destructive));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+  --color-accent: hsl(var(--accent));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-muted: hsl(var(--muted));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+  --color-secondary: hsl(var(--secondary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-primary: hsl(var(--primary));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+  --color-popover: hsl(var(--popover));
+  --color-card-foreground: hsl(var(--card-foreground));
+  --color-card: hsl(var(--card));
+  --color-foreground: hsl(var(--foreground));
+  --color-background: hsl(var(--background));
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+  --background: 34 22% 96%;
+  --foreground: 30 5% 14%;
+  --card: 35 18% 94%;
+  --card-foreground: 30 5% 14%;
+  --popover: 35 18% 94%;
+  --popover-foreground: 30 5% 14%;
+  --primary: 18 62% 52%;
+  --primary-foreground: 40 20% 97%;
+  --secondary: 34 12% 89%;
+  --secondary-foreground: 30 5% 30%;
+  --muted: 34 12% 89%;
+  --muted-foreground: 30 5% 40%;
+  --accent: 34 12% 89%;
+  --accent-foreground: 30 5% 30%;
+  --destructive: 0 60% 50%;
+  --border: 32 12% 82%;
+  --input: 32 12% 82%;
+  --ring: 18 62% 52%;
+  --chart-1: 18 62% 52%;
+  --chart-2: 145 50% 42%;
+  --chart-3: 45 70% 50%;
+  --chart-4: 30 80% 55%;
+  --chart-5: 30 5% 45%;
+  --radius: 0.75rem;
+  --sidebar: 34 24% 92%;
+  --sidebar-foreground: 30 5% 14%;
+  --sidebar-primary: 18 62% 52%;
+  --sidebar-primary-foreground: 40 20% 97%;
+  --sidebar-accent: 34 14% 86%;
+  --sidebar-accent-foreground: 30 5% 30%;
+  --sidebar-border: 31 12% 80%;
+  --sidebar-ring: 18 62% 52%;
+}
+
+.dark {
+  --background: 220 8% 7%;
+  --foreground: 210 9% 90%;
+  --card: 220 7% 10%;
+  --card-foreground: 210 9% 90%;
+  --popover: 220 7% 10%;
+  --popover-foreground: 210 9% 90%;
+  --primary: 16 62% 58%;
+  --primary-foreground: 220 8% 8%;
+  --secondary: 220 6% 15%;
+  --secondary-foreground: 210 7% 76%;
+  --muted: 220 6% 15%;
+  --muted-foreground: 214 6% 60%;
+  --accent: 220 6% 15%;
+  --accent-foreground: 210 7% 76%;
+  --destructive: 0 55% 50%;
+  --border: 220 6% 20%;
+  --input: 220 6% 20%;
+  --ring: 16 62% 58%;
+  --chart-1: 16 62% 58%;
+  --chart-2: 145 40% 48%;
+  --chart-3: 45 65% 58%;
+  --chart-4: 30 75% 60%;
+  --chart-5: 214 6% 58%;
+  --sidebar: 220 8% 10%;
+  --sidebar-foreground: 210 9% 90%;
+  --sidebar-primary: 16 62% 58%;
+  --sidebar-primary-foreground: 220 8% 8%;
+  --sidebar-accent: 220 7% 15%;
+  --sidebar-accent-foreground: 210 7% 76%;
+  --sidebar-border: 220 6% 20%;
+  --sidebar-ring: 16 62% 58%;
+}
+
+.rano-metric-selector {
+  --metric-surface: #fafbfc;
+  --metric-border: #d9dfe5;
+  --metric-text: #515d6a;
+  --metric-selected: #e9eff6;
+  --metric-selected-border: #829ab3;
+  --metric-selected-text: #425c78;
+  --metric-hover: #f0edf5;
+  --metric-hover-border: #aaa0bb;
+}
+
+.dark .rano-metric-selector {
+  --metric-surface: #23262b;
+  --metric-border: #454b55;
+  --metric-text: #c3cbd5;
+  --metric-selected: #303e50;
+  --metric-selected-border: #8aa2bd;
+  --metric-selected-text: #e0e9f4;
+  --metric-hover: #373340;
+  --metric-hover-border: #a59ab6;
+}
+
+.rano-metric-tab {
+  background: var(--metric-surface);
+  border-color: var(--metric-border);
+  color: var(--metric-text);
+  --tw-ring-color: var(--metric-selected-border);
+}
+
+.rano-metric-tab:hover {
+  background: var(--metric-hover);
+  border-color: var(--metric-hover-border);
+}
+
+.rano-metric-tab[aria-selected="true"] {
+  background: var(--metric-selected);
+  border-color: var(--metric-selected-border);
+  color: var(--metric-selected-text);
+  box-shadow: inset 0 -2px 0 var(--metric-selected-border);
+}

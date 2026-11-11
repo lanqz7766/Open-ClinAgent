@@ -1,0 +1,20 @@
+-e .[dev]
+nibabel>=5.0
+pydicom
+SimpleITK>=2.3
+dcm2bids
+pybids
+torch
+monai
+matplotlib>=3.7
+Pillow>=10.0
+numpy>=1.24
+jinja2>=3.1
+openai>=1.0
+anthropic>=0.20
+scipy>=1.10
+
+# Optional:
+# highdicom was intentionally left out of the default neuro requirements on
+# this machine because its pyjpegls dependency failed to build under the
+# current toolchain.

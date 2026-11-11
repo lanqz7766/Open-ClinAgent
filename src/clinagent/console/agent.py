@@ -1,0 +1,2298 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Any
+
+from clinagent.console.intent_session import (
+    build_session_router_context,
+    load_session_intent_state,
+    should_bias_to_session_workflow,
+)
+from clinagent.console.semantic_router import retrieve_semantic_workflow_candidates
+from clinagent.console.workspace import WORKFLOWS, augment_message_with_ingest_context, rank_workflows, route_general_query
+from clinagent.console.demo import demo_workspace_store
+from clinagent.families.findings.workspace import findings_closure_store
+from clinagent.families.diagnosis.workspace import missed_diagnosis_store
+from clinagent.families.neuro.knowledge import GatewayNeuroKnowledgeClient
+from clinagent.families.neuro.longitudinal_proteas import (
+    DEFAULT_NEURO_DATA_ENV,
+    build_neuro_longitudinal_workspace,
+    summarize_neuro_longitudinal_workspace,
+)
+from clinagent.families.neuro.registration import apply_neuro_transform, coregister_longitudinal, coregister_sequences
+from clinagent.families.neuro.tools import BrainTumorSegmentationTool, DeepPrepPreprocessingTool, NNUNetBrainSegmentationTool
+from clinagent.families.neuro.report_generator import build_neuro_report_bundle
+from clinagent.families.neuro.visualization import build_neuro_visualization_bundle
+from clinagent.platform.execution_profiles import get_execution_profile
+from clinagent.families.shared.reporting import build_report_document_from_workspace, export_report_bundle
+from clinagent.families.queue.workspace import queue_triage_store
+from clinagent.families.screening.workspace import screening_gap_store
+from clinagent.families.safety.workspace import KNOWLEDGE_BASE, safety_monitor_store
+from clinagent.platform.config import load_settings
+from clinagent.platform.local_data import resolve_skills_dirs
+from clinagent.platform.runtime_bridge import LLMMessage, LLMProvider, ToolResult, create_agent
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+SKILLS_DIRS = resolve_skills_dirs()
+SKILLS_DIR = SKILLS_DIRS[0] if SKILLS_DIRS else str(REPO_ROOT / "skills")
+
+
+def _is_proteas_patient_id(value: Any) -> bool:
+    text = str(value or "").strip()
+    return bool(text) and text.upper().startswith("P")
+
+
+def _resolve_neuro_patient_id(args: dict[str, Any]) -> str | None:
+    if _is_proteas_patient_id(args.get("patient_id")):
+        return str(args["patient_id"]).strip().upper()
+    if _is_proteas_patient_id(args.get("case_id")):
+        return str(args["case_id"]).strip().upper()
+    return None
+
+
+def _bool_arg(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _build_neuro_workspace_payload(args: dict[str, Any], *, prefer_proteas: bool = False) -> dict[str, Any] | None:
+    patient_id = _resolve_neuro_patient_id(args) or "P28"
+    data_root = args.get("data_root")
+    compact = _bool_arg(args.get("compact"), default=True)
+    materialize_assets = _bool_arg(args.get("materialize_assets"), default=True)
+
+    if prefer_proteas or data_root or os.getenv(DEFAULT_NEURO_DATA_ENV):
+        try:
+            workspace = build_neuro_longitudinal_workspace(
+                data_root=data_root,
+                patient_id=patient_id,
+                materialize_assets=materialize_assets,
+            )
+            return summarize_neuro_longitudinal_workspace(workspace) if compact else workspace.model_dump()
+        except Exception:
+            return None
+    return None
+
+
+def _build_neuro_knowledge_client() -> GatewayNeuroKnowledgeClient:
+    settings = load_settings()
+    return GatewayNeuroKnowledgeClient(
+        base_url=settings.gateway_base_url,
+        timeout_s=settings.connector_timeout_s,
+    )
+
+
+class WorkflowCatalogTool:
+    name = "workflow_catalog"
+    description = "Return the available ClinAgent workflows, their module ids, and supported tools."
+    parameters: dict[str, dict[str, Any]] = {}
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        return ToolResult(success=True, output=json.dumps(WORKFLOWS, indent=2))
+
+
+class ClinicalReportGeneratorTool:
+    name = "render_clinical_report"
+    description = "Render a compact clinical report bundle from a workflow workspace, with HTML export and optional PDF fallback."
+    parameters = {
+        "workflow_id": {
+            "type": "string",
+            "description": "Workflow family to render. Defaults to neuro_longitudinal.",
+            "required": False,
+        },
+        "case_id": {
+            "type": "string",
+            "description": "Optional case id for the target workflow.",
+            "required": False,
+        },
+        "data_root": {
+            "type": "string",
+            "description": "Optional PROTEAS data root for neuro_longitudinal.",
+            "required": False,
+        },
+        "output_dir": {
+            "type": "string",
+            "description": "Optional output directory for the report bundle.",
+            "required": False,
+        },
+        "export_pdf": {
+            "type": "boolean",
+            "description": "Attempt PDF export if the optional PDF backend is installed.",
+            "required": False,
+        },
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        workflow_id = str(args.get("workflow_id") or "neuro_longitudinal").strip()
+        case_id = str(args.get("case_id") or "").strip()
+        export_pdf = _bool_arg(args.get("export_pdf"), default=False)
+
+        if workflow_id == "neuro_longitudinal":
+            payload = _build_neuro_workspace_payload({**args, "compact": False}, prefer_proteas=True)
+            if payload is None:
+                case_id = case_id or demo_workspace_store.snapshot()["default_case_id"]
+                payload = demo_workspace_store.get_case(case_id)
+        elif workflow_id == "findings_closure":
+            case_id = case_id or findings_closure_store.snapshot()["default_case_id"]
+            payload = findings_closure_store.get_case(case_id)
+        elif workflow_id == "queue_triage":
+            case_id = case_id or queue_triage_store.snapshot()["default_case_id"]
+            payload = queue_triage_store.get_case(case_id)
+        elif workflow_id == "missed_diagnosis_detection":
+            case_id = case_id or missed_diagnosis_store.snapshot()["default_case_id"]
+            payload = missed_diagnosis_store.get_case(case_id)
+        elif workflow_id == "screening_gap_closure":
+            case_id = case_id or screening_gap_store.snapshot()["default_case_id"]
+            payload = screening_gap_store.get_case(case_id)
+        elif workflow_id == "radiation_safety_monitor":
+            case_id = case_id or safety_monitor_store.snapshot()["default_case_id"]
+            payload = safety_monitor_store.get_case(case_id)
+        else:
+            payload = demo_workspace_store.snapshot()["workspace"]
+
+        if payload is None:
+            return ToolResult(success=False, output="", error=f"Could not resolve a workspace for {workflow_id}.")
+
+        report_document = build_report_document_from_workspace(payload, default_title=payload.get("title"))
+        target_dir = Path(
+            args.get("output_dir")
+            or payload.get("source", {}).get("output_root")
+            or REPO_ROOT / ".clinagent" / "derived" / "reports" / workflow_id / (case_id or payload.get("id", "case"))
+        )
+        bundle = export_report_bundle(report_document, target_dir, stem="report", export_pdf=export_pdf)
+        compact = {
+            "workflow_id": workflow_id,
+            "case_id": case_id or payload.get("id"),
+            "title": bundle.document.title,
+            "summary": bundle.document.summary,
+            "highlight": bundle.document.highlight,
+            "badge_label": bundle.document.badge_label,
+            "html_path": bundle.html_path,
+            "json_path": bundle.json_path,
+            "pdf_path": bundle.pdf_path,
+            "pdf_supported": bundle.pdf_supported,
+            "metrics": [metric.model_dump() for metric in bundle.document.metrics],
+            "sections": [section.model_dump() for section in bundle.document.sections],
+            "figures": [figure.model_dump() for figure in bundle.document.figures],
+        }
+        return ToolResult(success=True, output=json.dumps(compact, indent=2))
+
+
+class NeuroWorkspaceTool:
+    name = "get_neuro_workspace"
+    description = "Return the current neuro longitudinal review workspace, including treatment-aligned MRI timeline, lesion burden trend, and the current physician brief."
+    parameters = {
+        "case_id": {
+            "type": "string",
+            "description": "Optional neuro case id. Defaults to the main mock longitudinal case.",
+            "required": False,
+        }
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        payload = _build_neuro_workspace_payload(args, prefer_proteas=False)
+        if payload is not None:
+            return ToolResult(success=True, output=json.dumps(payload, indent=2))
+
+        case_id = args.get("case_id") or demo_workspace_store.snapshot()["default_case_id"]
+        workspace = demo_workspace_store.get_case(case_id)
+        compact = {
+            "id": workspace["id"],
+            "title": workspace["title"],
+            "patient": workspace["patient"],
+            "analysis": workspace["analysis"],
+            "report": {
+                "title": workspace["report"]["title"],
+                "summary": workspace["report"]["summary"],
+                "risk_level": workspace["report"]["risk_level"],
+            },
+            "timeline": workspace["timeline"],
+        }
+        return ToolResult(success=True, output=json.dumps(compact, indent=2))
+
+
+class DicomSeriesSelectorTool:
+    name = "dicom_series_selector"
+    description = "Select the preferred longitudinal MRI series for a neuro review case and summarize the chosen sequence family at each timepoint."
+    parameters = {
+        "case_id": {
+            "type": "string",
+            "description": "Optional neuro case id. Defaults to the current longitudinal neuro demo case.",
+            "required": False,
+        }
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        payload = _build_neuro_workspace_payload({**args, "compact": False}, prefer_proteas=True)
+        if payload is None:
+            case_id = args.get("case_id") or demo_workspace_store.snapshot()["default_case_id"]
+            payload = demo_workspace_store.get_case(case_id)
+        case_id = payload["id"]
+        series = [
+            {
+                "timepoint": item["timepoint"],
+                "study_date": item["study_date"],
+                "preferred_sequence": item.get("sequence") or next(
+                    (series["modality"] for series in item.get("series", []) if series.get("modality") == "T1C"),
+                    "T1C",
+                ),
+                "source_type": item.get("source_type", ""),
+            }
+            for item in payload["timeline"]
+        ]
+        return ToolResult(success=True, output=json.dumps({"case_id": case_id, "series": series}, indent=2))
+
+
+class SearchNeuroKnowledgeTool:
+    name = "search_neuro_knowledge"
+    description = "Search the MR-RATE knowledge index for case and study matches by keyword."
+    parameters = {
+        "query": {
+            "type": "string",
+            "description": "Keyword query for findings, impression, or case summary text.",
+            "required": True,
+        }
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return ToolResult(success=False, output="", error="query is required")
+        try:
+            result = _build_neuro_knowledge_client().search(query)
+            return ToolResult(success=True, output=json.dumps(result, indent=2))
+        except Exception as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+
+
+class NeuroKnowledgeCaseTool:
+    name = "get_neuro_knowledge_case"
+    description = "Return the MR-RATE case summary, study list, and report availability for a patient_uid."
+    parameters = {
+        "patient_uid": {
+            "type": "string",
+            "description": "MR-RATE case identifier.",
+            "required": True,
+        }
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        patient_uid = str(args.get("patient_uid") or "").strip()
+        if not patient_uid:
+            return ToolResult(success=False, output="", error="patient_uid is required")
+        try:
+            result = _build_neuro_knowledge_client().get_case(patient_uid)
+            return ToolResult(success=True, output=json.dumps(result, indent=2))
+        except Exception as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+
+
+class NeuroKnowledgeCaseAssetsTool:
+    name = "get_neuro_knowledge_case_assets"
+    description = "Return indexed MR-RATE MRI and segmentation asset paths for a patient_uid."
+    parameters = {
+        "patient_uid": {
+            "type": "string",
+            "description": "MR-RATE case identifier.",
+            "required": True,
+        }
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        patient_uid = str(args.get("patient_uid") or "").strip()
+        if not patient_uid:
+            return ToolResult(success=False, output="", error="patient_uid is required")
+        try:
+            result = _build_neuro_knowledge_client().get_case_assets(patient_uid)
+            return ToolResult(success=True, output=json.dumps(result, indent=2))
+        except Exception as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+
+
+class NeuroKnowledgeStudyTool:
+    name = "get_neuro_knowledge_study"
+    description = "Return study-level report content, summary, and metadata for an MR-RATE study_uid."
+    parameters = {
+        "study_uid": {
+            "type": "string",
+            "description": "MR-RATE study identifier.",
+            "required": True,
+        }
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        study_uid = str(args.get("study_uid") or "").strip()
+        if not study_uid:
+            return ToolResult(success=False, output="", error="study_uid is required")
+        try:
+            result = _build_neuro_knowledge_client().get_study(study_uid)
+            return ToolResult(success=True, output=json.dumps(result, indent=2))
+        except Exception as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+
+
+class NeuroKnowledgeCohortTool:
+    name = "get_neuro_knowledge_cohort"
+    description = "Return the current provisional MR-RATE cohort manifest used by the knowledge explorer."
+    parameters: dict[str, dict[str, Any]] = {}
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        try:
+            result = _build_neuro_knowledge_client().get_cohort()
+            return ToolResult(success=True, output=json.dumps(result, indent=2))
+        except Exception as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+
+
+class BrainSegServiceHealthTool:
+    name = "check_brain_seg_service_health"
+    description = "Check whether the local brain segmentation nnUNet service is available."
+    parameters: dict[str, dict[str, Any]] = {}
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        try:
+            result = NNUNetBrainSegmentationTool().check_health()
+            return ToolResult(success=True, output=json.dumps(result, indent=2))
+        except Exception as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+
+
+class BrainStructureModelInfoTool:
+    name = "get_brain_structure_model_info"
+    description = "Return metadata for the local whole-brain nnUNet segmentation model, including label schema path."
+    parameters: dict[str, dict[str, Any]] = {}
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        try:
+            result = NNUNetBrainSegmentationTool().get_model_info()
+            return ToolResult(success=True, output=json.dumps(result, indent=2))
+        except Exception as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+
+
+class RunBrainStructureSegmentationTool:
+    name = "run_brain_structure_segmentation"
+    description = "Prepare a T1 NIfTI with LIA + basic QC, then call the local nnUNet service to produce a segmentation NIfTI."
+    parameters = {
+        "input_nifti_path": {
+            "type": "string",
+            "description": "Absolute path to the input T1 NIfTI file.",
+            "required": True,
+        },
+        "output_seg_path": {
+            "type": "string",
+            "description": "Optional absolute path for the output segmentation NIfTI.",
+            "required": False,
+        },
+        "prepared_input_path": {
+            "type": "string",
+            "description": "Optional absolute path for the LIA-oriented service input.",
+            "required": False,
+        },
+        "sequence_hint": {
+            "type": "string",
+            "description": "Optional explicit sequence hint such as T1w.",
+            "required": False,
+        },
+        "device": {
+            "type": "string",
+            "description": "Inference device: auto, cuda, or cpu.",
+            "required": False,
+        },
+        "gpu_id": {
+            "type": "integer",
+            "description": "Optional GPU index.",
+            "required": False,
+        },
+        "engine": {
+            "type": "string",
+            "description": "Optional service engine. Defaults to custom.",
+            "required": False,
+        },
+        "overwrite": {
+            "type": "boolean",
+            "description": "Whether an existing segmentation may be overwritten.",
+            "required": False,
+        },
+    }
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        try:
+            result = NNUNetBrainSegmentationTool().run(
+                input_nifti_path=str(args.get("input_nifti_path") or ""),
+                output_seg_path=args.get("output_seg_path"),
+                prepared_input_path=args.get("prepared_input_path"),
+                sequence_hint=args.get("sequence_hint"),
+                device=str(args.get("device") or "auto"),
+                gpu_id=args.get("gpu_id"),
+                engine=str(args.get("engine") or "custom"),
+                overwrite=_bool_arg(args.get("overwrite"), default=True),
+                include_model_info=True,
+            )
+            return ToolResult(success=True, output=json.dumps(result, indent=2))
+        except Exception as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+
+
+class CoregisterNeuroSequencesTool:
+    name = "coregister_neuro_sequences"
+    description = (
+        "Coregister a moving neuro MRI NIfTI to a fixed/reference NIfTI; returns a resampled image, "
+        "moving-to-fixed affine transform, QC metrics, and a preprocessing manifest fragment."
+    )
+    parameters = {
+        "fixed_image_path": {
+            "type": "string",
+            "description": "Absolute path to the reference NIfTI, for example T1w or T1 post-contrast.",
+            "required": True,
+        },
+        "moving_image_path": {
+            "type": "string",
+            "description": "Absolute path to the moving NIfTI, for example FLAIR/T2/T1C/follow-up.",
+            "required": True,
+        },
+        "output_dir": {
+            "type": "string",
+            "description": "Output directory for the aligned image and transform JSON.",
+            "required": True,
+        },
+        "case_id": {"type": "string", "description": "Optional case id for the manifest fragment.", "required": False},
+        "method": {"type": "string", "description": "rigid (default): rotation and translation; translation: coarse alignment only.", "required": False},
+        "fixed_label": {"type": "string", "description": "Human-readable fixed image label.", "required": False},
+        "moving_label": {"type": "string", "description": "Human-readable moving image label.", "required": False},
+        "initialization": {
+            "type": "string",
+            "description": "Initialization mode: header, center, or com. Defaults to com.",
+            "required": False,
+        },
+        "interpolation": {
+            "type": "string",
+            "description": "Interpolation mode: linear for images, nearest for labels.",
+            "required": False,
+        },
+        "overwrite": {"type": "boolean", "description": "Whether to overwrite outputs.", "required": False},
+    }
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        try:
+            result = coregister_sequences(
+                fixed_image_path=str(args.get("fixed_image_path") or ""),
+                moving_image_path=str(args.get("moving_image_path") or ""),
+                method=str(args.get("method") or "rigid"),
+                output_dir=str(args.get("output_dir") or ""),
+                case_id=args.get("case_id"),
+                fixed_label=str(args.get("fixed_label") or "fixed"),
+                moving_label=str(args.get("moving_label") or "moving"),
+                initialization=str(args.get("initialization") or "com"),
+                interpolation=str(args.get("interpolation") or "linear"),
+                overwrite=_bool_arg(args.get("overwrite"), default=True),
+            )
+            return ToolResult(success=True, output=json.dumps(result, indent=2))
+        except Exception as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+
+
+class ApplyNeuroTransformTool:
+    name = "apply_neuro_transform"
+    description = "Apply a stored neuro transform to an image or segmentation and resample it onto a reference grid."
+    parameters = {
+        "source_image_path": {
+            "type": "string",
+            "description": "Absolute path to the source image or label map.",
+            "required": True,
+        },
+        "reference_image_path": {
+            "type": "string",
+            "description": "Absolute path to the reference image defining the output grid.",
+            "required": True,
+        },
+        "transform_path": {"type": "string", "description": "Transform JSON from coregistration.", "required": True},
+        "output_image_path": {"type": "string", "description": "Output NIfTI path.", "required": True},
+        "interpolation": {
+            "type": "string",
+            "description": "Use linear for images and nearest for masks/segmentations.",
+            "required": False,
+        },
+        "invert": {"type": "boolean", "description": "Apply the inverse transform.", "required": False},
+        "overwrite": {"type": "boolean", "description": "Whether to overwrite the output.", "required": False},
+    }
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        try:
+            result = apply_neuro_transform(
+                source_image_path=str(args.get("source_image_path") or ""),
+                reference_image_path=str(args.get("reference_image_path") or ""),
+                transform_path=str(args.get("transform_path") or ""),
+                output_image_path=str(args.get("output_image_path") or ""),
+                interpolation=str(args.get("interpolation") or "linear"),
+                invert=_bool_arg(args.get("invert"), default=False),
+                overwrite=_bool_arg(args.get("overwrite"), default=True),
+            )
+            return ToolResult(success=True, output=json.dumps(result, indent=2))
+        except Exception as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+
+
+class CoregisterNeuroLongitudinalTool:
+    name = "coregister_neuro_longitudinal"
+    description = (
+        "Coregister a follow-up neuro MRI NIfTI to a baseline/reference timepoint with conservative "
+        "longitudinal QC and no nonlinear deformation by default."
+    )
+    parameters = {
+        "baseline_image_path": {
+            "type": "string",
+            "description": "Absolute path to the baseline/reference timepoint NIfTI.",
+            "required": True,
+        },
+        "followup_image_path": {
+            "type": "string",
+            "description": "Absolute path to the follow-up/moving timepoint NIfTI.",
+            "required": True,
+        },
+        "output_dir": {
+            "type": "string",
+            "description": "Output directory for the aligned follow-up image and transform JSON.",
+            "required": True,
+        },
+        "case_id": {"type": "string", "description": "Optional case id for the manifest fragment.", "required": False},
+        "method": {"type": "string", "description": "rigid (default) or translation; never deformable.", "required": False},
+        "moving_modalities": {"type": "object", "description": "Optional t1n/t2w/t2f MRI paths for the full T1c-based alignment workflow. T1c is followup_image_path.", "required": False},
+        "mask_paths": {"type": "object", "description": "Optional seg and ground_truth_seg paths in moving T1c space; display transfer only.", "required": False},
+        "bias_correction": {"type": "boolean", "description": "Optional N4 correction on derived images only. Defaults false; do not repeat on preprocessed data without confirmation.", "required": False},
+        "baseline_label": {"type": "string", "description": "Human-readable baseline label.", "required": False},
+        "followup_label": {"type": "string", "description": "Human-readable follow-up label.", "required": False},
+        "initialization": {
+            "type": "string",
+            "description": "Initialization mode: header, center, or com. Defaults to com.",
+            "required": False,
+        },
+        "interpolation": {
+            "type": "string",
+            "description": "Interpolation mode: linear for images, nearest for labels.",
+            "required": False,
+        },
+        "overwrite": {"type": "boolean", "description": "Whether to overwrite outputs.", "required": False},
+    }
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        try:
+            if args.get("moving_modalities") or args.get("mask_paths") or args.get("bias_correction"):
+                import asyncio
+                from clinagent.families.neuro.registration.workflow import align_visit
+                result = await asyncio.to_thread(
+                    align_visit, reference_t1c=str(args.get("baseline_image_path") or ""),
+                    modalities={**(args.get("moving_modalities") or {}), "t1c": str(args.get("followup_image_path") or "")},
+                    masks=args.get("mask_paths") or {}, output_dir=Path(str(args.get("output_dir") or "")),
+                    bias_correction=_bool_arg(args.get("bias_correction"), default=False),
+                )
+                return ToolResult(success=True, output=json.dumps(result, indent=2))
+            result = coregister_longitudinal(
+                baseline_image_path=str(args.get("baseline_image_path") or ""),
+                followup_image_path=str(args.get("followup_image_path") or ""),
+                method=str(args.get("method") or "rigid"),
+                output_dir=str(args.get("output_dir") or ""),
+                case_id=args.get("case_id"),
+                baseline_label=str(args.get("baseline_label") or "baseline"),
+                followup_label=str(args.get("followup_label") or "followup"),
+                initialization=str(args.get("initialization") or "com"),
+                interpolation=str(args.get("interpolation") or "linear"),
+                overwrite=_bool_arg(args.get("overwrite"), default=True),
+            )
+            return ToolResult(success=True, output=json.dumps(result, indent=2))
+        except Exception as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+
+
+class DeepPrepToolHealthTool:
+    name = "check_deepprep_tool_health"
+    description = "Check whether the configured remote DeepPrep preprocessing wrapper is available."
+    parameters: dict[str, dict[str, Any]] = {}
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        try:
+            result = DeepPrepPreprocessingTool().check_health()
+            return ToolResult(success=True, output=json.dumps(result, indent=2))
+        except Exception as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+
+
+class RunDeepPrepPreprocessingTool:
+    name = "run_deepprep_preprocessing"
+    description = (
+        "Run or dry-run remote DeepPrep preprocessing for a BIDS neuro MRI dataset; returns job metadata, "
+        "QC report paths, preprocessing derivatives, and co-registration transform manifest entries."
+    )
+    parameters = {
+        "operation": {
+            "type": "string",
+            "description": "Operation: run, status, or manifest. Use health through check_deepprep_tool_health.",
+            "required": False,
+        },
+        "bids_dir": {
+            "type": "string",
+            "description": "Absolute BIDS input directory on the configured remote server.",
+            "required": False,
+        },
+        "output_dir": {
+            "type": "string",
+            "description": "Absolute DeepPrep output directory on the configured remote server.",
+            "required": False,
+        },
+        "fs_license_file": {
+            "type": "string",
+            "description": "Absolute FreeSurfer license file on the configured remote server.",
+            "required": False,
+        },
+        "participant_label": {
+            "type": "array",
+            "description": "Subject labels, with or without sub- prefix.",
+            "required": False,
+        },
+        "bold_task_type": {
+            "type": "string",
+            "description": "BOLD task label such as rest.",
+            "required": False,
+        },
+        "mode": {
+            "type": "string",
+            "description": "Processing mode: full, anat_only, or bold_only.",
+            "required": False,
+        },
+        "device": {
+            "type": "string",
+            "description": "DeepPrep device: auto, cpu, or GPU index.",
+            "required": False,
+        },
+        "runner": {
+            "type": "string",
+            "description": "Remote container runner: docker, singularity, or apptainer.",
+            "required": False,
+        },
+        "sif_path": {
+            "type": "string",
+            "description": "Absolute DeepPrep SIF path on the remote server for Singularity/Apptainer.",
+            "required": False,
+        },
+        "job_id": {
+            "type": "string",
+            "description": "Job id for status lookup.",
+            "required": False,
+        },
+        "dry_run": {
+            "type": "boolean",
+            "description": "Build and record the command without launching DeepPrep. Defaults to true.",
+            "required": False,
+        },
+        "detach": {
+            "type": "boolean",
+            "description": "Run in the background. Defaults to true for real jobs.",
+            "required": False,
+        },
+        "resume": {
+            "type": "boolean",
+            "description": "Resume an interrupted DeepPrep job.",
+            "required": False,
+        },
+        "skip_bids_validation": {
+            "type": "boolean",
+            "description": "Skip BIDS validation.",
+            "required": False,
+        },
+    }
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        try:
+            result = DeepPrepPreprocessingTool().run(
+                operation=str(args.get("operation") or "run"),
+                bids_dir=args.get("bids_dir"),
+                output_dir=args.get("output_dir"),
+                fs_license_file=args.get("fs_license_file"),
+                participant_label=args.get("participant_label"),
+                bold_task_type=args.get("bold_task_type"),
+                mode=str(args.get("mode") or "full"),
+                device=str(args.get("device") or "auto"),
+                runner=args.get("runner"),
+                sif_path=args.get("sif_path"),
+                job_id=args.get("job_id"),
+                dry_run=_bool_arg(args.get("dry_run"), default=True),
+                detach=_bool_arg(args.get("detach"), default=True),
+                resume=_bool_arg(args.get("resume"), default=False),
+                skip_bids_validation=_bool_arg(args.get("skip_bids_validation"), default=False),
+            )
+            return ToolResult(success=True, output=json.dumps(result, indent=2))
+        except Exception as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+
+
+class BrainTumorSegServiceHealthTool:
+    name = "check_brain_tumor_seg_service_health"
+    description = "Check whether the research/demo brain tumor segmentation service is available."
+    parameters: dict[str, dict[str, Any]] = {}
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        try:
+            result = BrainTumorSegmentationTool().check_health()
+            return ToolResult(success=True, output=json.dumps(result, indent=2))
+        except Exception as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+
+
+class BrainTumorSegModelInfoTool:
+    name = "get_brain_tumor_seg_model_info"
+    description = "Return metadata for the research/demo glioma segmentation model."
+    parameters: dict[str, dict[str, Any]] = {}
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        try:
+            result = BrainTumorSegmentationTool().get_model_info()
+            return ToolResult(success=True, output=json.dumps(result, indent=2))
+        except Exception as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+
+
+class RunBrainTumorSegmentationTool:
+    name = "run_brain_tumor_segmentation"
+    description = (
+        "Run research/demo glioma MRI segmentation from multimodal NIfTI inputs; returns segmentation, "
+        "WT/TC/ET-style volumes, QC warnings, and an overlay preview. This is not a diagnostic tool."
+    )
+    parameters = {
+        "t1n_nifti_path": {
+            "type": "string",
+            "description": "Optional absolute path to a native T1 NIfTI.",
+            "required": False,
+        },
+        "t1c_nifti_path": {
+            "type": "string",
+            "description": "Absolute path to a contrast-enhanced T1 NIfTI.",
+            "required": True,
+        },
+        "t2w_nifti_path": {
+            "type": "string",
+            "description": "Optional absolute path to a T2-weighted NIfTI.",
+            "required": False,
+        },
+        "t2f_nifti_path": {
+            "type": "string",
+            "description": "Absolute path to a FLAIR/T2-FLAIR NIfTI.",
+            "required": True,
+        },
+        "output_dir": {
+            "type": "string",
+            "description": "Optional local output directory for tumor segmentation artifacts.",
+            "required": False,
+        },
+        "device": {
+            "type": "string",
+            "description": "Inference device: auto, cuda, or cpu.",
+            "required": False,
+        },
+        "model_id": {
+            "type": "string",
+            "description": "Optional service-side model id.",
+            "required": False,
+        },
+        "overwrite": {
+            "type": "boolean",
+            "description": "Whether existing output artifacts may be overwritten.",
+            "required": False,
+        },
+    }
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        try:
+            result = BrainTumorSegmentationTool().run(
+                t1n_nifti_path=args.get("t1n_nifti_path"),
+                t1c_nifti_path=args.get("t1c_nifti_path"),
+                t2w_nifti_path=args.get("t2w_nifti_path"),
+                t2f_nifti_path=args.get("t2f_nifti_path"),
+                output_dir=args.get("output_dir"),
+                device=str(args.get("device") or "auto"),
+                model_id=args.get("model_id"),
+                overwrite=_bool_arg(args.get("overwrite"), default=True),
+            )
+            return ToolResult(success=True, output=json.dumps(result, indent=2))
+        except Exception as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+
+
+class BrainMetResponseTrackerTool:
+    name = "brain_met_response_tracker"
+    description = "Return the longitudinal lesion response metrics for a neuro review case, including burden trend and recent interval change."
+    parameters = {
+        "case_id": {
+            "type": "string",
+            "description": "Optional neuro case id. Defaults to the current longitudinal neuro demo case.",
+            "required": False,
+        }
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        payload = _build_neuro_workspace_payload({**args, "compact": False}, prefer_proteas=True)
+        if payload is None:
+            case_id = args.get("case_id") or demo_workspace_store.snapshot()["default_case_id"]
+            payload = demo_workspace_store.get_case(case_id)
+        case_id = payload["id"]
+        analysis = payload["analysis"]
+        points = [
+            {
+                "timepoint": item["timepoint"],
+                "study_date": item["study_date"],
+                "lesion_volume_ml": item["lesion_volume_ml"],
+                "tumor_volume_ml": item.get("tumor_volume_ml"),
+                "all_volume_ml": item.get("all_volume_ml"),
+                "oedema_volume_ml": item.get("oedema_volume_ml"),
+                "percent_change_from_baseline": item.get("cumulative_change_pct") or item.get("percent_change_from_baseline"),
+                "percent_change_from_prior": item.get("interval_change_pct") or item.get("percent_change_from_prior"),
+                "source_type": item.get("source_type"),
+            }
+            for item in payload["timeline"]
+        ]
+        compact = {
+            "case_id": case_id,
+            "risk_level": analysis.get("risk_level"),
+            "risk_reason": analysis.get("risk_reason"),
+            "baseline_total_ml": analysis.get("baseline_total_ml", analysis.get("baseline_volume_ml")),
+            "latest_total_ml": analysis.get("latest_total_ml", analysis.get("latest_volume_ml")),
+            "recent_segment_pct": analysis.get("recent_segment_pct", analysis.get("recent_interval_change_pct")),
+            "delta_pct": analysis.get("delta_pct", analysis.get("cumulative_change_pct")),
+            "points": points,
+        }
+        return ToolResult(success=True, output=json.dumps(compact, indent=2))
+
+
+class RTTimelineAlignerTool:
+    name = "rt_timeline_aligner"
+    description = "Return a treatment-aligned timeline for the neuro review case, anchoring serial MRI studies to the radiotherapy event."
+    parameters = {
+        "case_id": {
+            "type": "string",
+            "description": "Optional neuro case id. Defaults to the current longitudinal neuro demo case.",
+            "required": False,
+        }
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        payload = _build_neuro_workspace_payload({**args, "compact": False}, prefer_proteas=True)
+        if payload is None:
+            case_id = args.get("case_id") or demo_workspace_store.snapshot()["default_case_id"]
+            payload = demo_workspace_store.get_case(case_id)
+        case_id = payload["id"]
+        events = payload.get("workflow", {}).get("events", [])
+        rt_date = next((event.get("date") for event in events if event.get("label") == "Radiotherapy"), "N/A")
+        timeline = [
+            {
+                "label": "Radiotherapy event",
+                "date": rt_date,
+                "type": "treatment",
+            }
+        ]
+        timeline.extend(
+            {
+                "label": item["timepoint"],
+                "date": item["study_date"],
+                "type": "imaging",
+                "sequence": item["sequence"],
+            }
+            for item in payload["timeline"]
+        )
+        return ToolResult(success=True, output=json.dumps({"case_id": case_id, "timeline": timeline}, indent=2))
+
+
+class SlicePreviewRendererTool:
+    name = "slice_preview_renderer"
+    description = "Return the current preview image payload for the neuro review case, including caption and display title."
+    parameters = {
+        "case_id": {
+            "type": "string",
+            "description": "Optional neuro case id. Defaults to the current longitudinal neuro demo case.",
+            "required": False,
+        }
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        payload = _build_neuro_workspace_payload({**args, "compact": False}, prefer_proteas=True)
+        if payload is None:
+            case_id = args.get("case_id") or demo_workspace_store.snapshot()["default_case_id"]
+            payload = demo_workspace_store.get_case(case_id)
+        case_id = payload["id"]
+        compact = {
+            "case_id": case_id,
+            "preview": payload["imaging_preview"],
+        }
+        return ToolResult(success=True, output=json.dumps(compact, indent=2))
+
+
+class LesionTrendPlotterTool:
+    name = "lesion_trend_plotter"
+    description = "Return the visual trend payload and headline metrics for a longitudinal neuro-oncology case."
+    parameters = {
+        "patient_id": {"type": "string", "description": "Optional PROTEAS patient id such as P28.", "required": False},
+        "data_root": {"type": "string", "description": "Optional PROTEAS data root.", "required": False},
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        payload = _build_neuro_workspace_payload({**args, "compact": False}, prefer_proteas=True)
+        if payload is None:
+            return ToolResult(success=False, output="", error=f"Configure {DEFAULT_NEURO_DATA_ENV} or pass data_root.")
+        return ToolResult(
+            success=True,
+            output=json.dumps(
+                {
+                    "id": payload.get("id"),
+                    "trend_svg": payload.get("visualizations", {}).get("trend_svg"),
+                    "baseline_volume_ml": payload.get("analysis", {}).get("baseline_volume_ml"),
+                    "latest_volume_ml": payload.get("analysis", {}).get("latest_volume_ml"),
+                    "cumulative_change_pct": payload.get("analysis", {}).get("cumulative_change_pct"),
+                    "risk_level": payload.get("analysis", {}).get("risk_level"),
+                },
+                indent=2,
+            ),
+        )
+
+
+class TreatmentEventTimelineRendererTool:
+    name = "treatment_event_timeline_renderer"
+    description = "Return the treatment-aligned timeline visual and recorded clinical events for a longitudinal neuro case."
+    parameters = {
+        "patient_id": {"type": "string", "description": "Optional PROTEAS patient id such as P28.", "required": False},
+        "data_root": {"type": "string", "description": "Optional PROTEAS data root.", "required": False},
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        payload = _build_neuro_workspace_payload({**args, "compact": False}, prefer_proteas=True)
+        if payload is None:
+            return ToolResult(success=False, output="", error=f"Configure {DEFAULT_NEURO_DATA_ENV} or pass data_root.")
+        return ToolResult(
+            success=True,
+            output=json.dumps(
+                {
+                    "id": payload.get("id"),
+                    "timeline_svg": payload.get("visualizations", {}).get("timeline_svg"),
+                    "events": payload.get("workflow", {}).get("events", []),
+                    "timepoints": [
+                        {"timepoint": item.get("timepoint"), "study_date": item.get("study_date")}
+                        for item in payload.get("timeline", [])
+                    ],
+                },
+                indent=2,
+            ),
+        )
+
+
+class KeySliceSelectorTool:
+    name = "key_slice_selector"
+    description = "Return the key longitudinal checkpoints selected for representative comparison in a neuro longitudinal case."
+    parameters = {
+        "patient_id": {"type": "string", "description": "Optional PROTEAS patient id such as P28.", "required": False},
+        "data_root": {"type": "string", "description": "Optional PROTEAS data root.", "required": False},
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        payload = _build_neuro_workspace_payload({**args, "compact": False}, prefer_proteas=True)
+        if payload is None:
+            return ToolResult(success=False, output="", error=f"Configure {DEFAULT_NEURO_DATA_ENV} or pass data_root.")
+        timeline = payload.get("timeline", [])
+        if not timeline:
+            selected = []
+        else:
+            selected = [timeline[0], timeline[len(timeline) // 2], timeline[-1]]
+        return ToolResult(
+            success=True,
+            output=json.dumps(
+                {
+                    "id": payload.get("id"),
+                    "selected_timepoints": [
+                        {
+                            "timepoint": item.get("timepoint"),
+                            "study_date": item.get("study_date"),
+                            "lesion_volume_ml": item.get("lesion_volume_ml"),
+                            "mask_member": item.get("mask_member"),
+                        }
+                        for item in selected
+                    ],
+                },
+                indent=2,
+            ),
+        )
+
+
+class OverlayComposerTool:
+    name = "overlay_composer"
+    description = "Return the representative preview payload and mask references used for neuro image comparison."
+    parameters = {
+        "patient_id": {"type": "string", "description": "Optional PROTEAS patient id such as P28.", "required": False},
+        "data_root": {"type": "string", "description": "Optional PROTEAS data root.", "required": False},
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        payload = _build_neuro_workspace_payload({**args, "compact": False}, prefer_proteas=True)
+        if payload is None:
+            return ToolResult(success=False, output="", error=f"Configure {DEFAULT_NEURO_DATA_ENV} or pass data_root.")
+        return ToolResult(
+            success=True,
+            output=json.dumps(
+                {
+                    "id": payload.get("id"),
+                    "imaging_preview": payload.get("imaging_preview", {}),
+                    "comparison_svg": payload.get("visualizations", {}).get("comparison_svg"),
+                },
+                indent=2,
+            ),
+        )
+
+
+class LongitudinalComparisonPanelBuilderTool:
+    name = "longitudinal_comparison_panel_builder"
+    description = "Return the compact baseline-midpoint-latest comparison panel payload for a longitudinal neuro case."
+    parameters = {
+        "patient_id": {"type": "string", "description": "Optional PROTEAS patient id such as P28.", "required": False},
+        "data_root": {"type": "string", "description": "Optional PROTEAS data root.", "required": False},
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        payload = _build_neuro_workspace_payload({**args, "compact": False}, prefer_proteas=True)
+        if payload is None:
+            return ToolResult(success=False, output="", error=f"Configure {DEFAULT_NEURO_DATA_ENV} or pass data_root.")
+        timeline = payload.get("timeline", [])
+        selected = [timeline[0], timeline[len(timeline) // 2], timeline[-1]] if timeline else []
+        return ToolResult(
+            success=True,
+            output=json.dumps(
+                {
+                    "id": payload.get("id"),
+                    "comparison_svg": payload.get("visualizations", {}).get("comparison_svg"),
+                    "panels": [
+                        {
+                            "timepoint": item.get("timepoint"),
+                            "study_date": item.get("study_date"),
+                            "lesion_volume_ml": item.get("lesion_volume_ml"),
+                            "tumor_volume_ml": item.get("tumor_volume_ml"),
+                        }
+                        for item in selected
+                    ],
+                },
+                indent=2,
+            ),
+        )
+
+
+class RiskSignalRendererTool:
+    name = "risk_signal_renderer"
+    description = "Return the compact headline risk signal used in the neuro longitudinal review."
+    parameters = {
+        "patient_id": {"type": "string", "description": "Optional PROTEAS patient id such as P28.", "required": False},
+        "data_root": {"type": "string", "description": "Optional PROTEAS data root.", "required": False},
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        payload = _build_neuro_workspace_payload({**args, "compact": False}, prefer_proteas=True)
+        if payload is None:
+            return ToolResult(success=False, output="", error=f"Configure {DEFAULT_NEURO_DATA_ENV} or pass data_root.")
+        analysis = payload.get("analysis", {})
+        return ToolResult(
+            success=True,
+            output=json.dumps(
+                {
+                    "id": payload.get("id"),
+                    "risk_level": analysis.get("risk_level"),
+                    "response_label": analysis.get("response_label"),
+                    "risk_reason": analysis.get("risk_reason"),
+                    "baseline_volume_ml": analysis.get("baseline_volume_ml"),
+                    "latest_volume_ml": analysis.get("latest_volume_ml"),
+                    "recent_interval_change_pct": analysis.get("recent_interval_change_pct"),
+                    "annualized_change_pct": analysis.get("annualized_change_pct"),
+                },
+                indent=2,
+            ),
+        )
+
+
+class NeuroLongitudinalWorkspaceTool:
+    name = "get_neuro_longitudinal_workspace"
+    description = "Return a PROTEAS-backed longitudinal neuro-oncology workspace with timeline, response tracking, report, and visualizations."
+    parameters = {
+        "patient_id": {
+            "type": "string",
+            "description": "Optional PROTEAS patient id such as P28. Defaults to the main local longitudinal case.",
+            "required": False,
+        },
+        "data_root": {
+            "type": "string",
+            "description": "Optional PROTEAS data root. Defaults to the configured local longitudinal data root.",
+            "required": False,
+        },
+        "compact": {
+            "type": "boolean",
+            "description": "Return the compact presentation payload instead of the full workspace object.",
+            "required": False,
+        },
+        "materialize_assets": {
+            "type": "boolean",
+            "description": "Write SVG visualization assets to the local derived output directory.",
+            "required": False,
+        },
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        payload = _build_neuro_workspace_payload(args, prefer_proteas=True)
+        if payload is None:
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    f"Configure {DEFAULT_NEURO_DATA_ENV} or pass data_root to use the PROTEAS-backed neuro longitudinal workspace."
+                ),
+            )
+        return ToolResult(success=True, output=json.dumps(payload, indent=2))
+
+
+class NeuroLongitudinalVisualsTool:
+    name = "get_neuro_longitudinal_visuals"
+    description = "Return the SVG trend, timeline, and comparison visuals for the longitudinal neuro-oncology workspace."
+    parameters = {
+        "patient_id": {
+            "type": "string",
+            "description": "Optional PROTEAS patient id such as P28.",
+            "required": False,
+        },
+        "data_root": {
+            "type": "string",
+            "description": "Optional PROTEAS data root.",
+            "required": False,
+        },
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        payload = _build_neuro_workspace_payload({**args, "compact": False}, prefer_proteas=True)
+        if payload is None:
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    f"Configure {DEFAULT_NEURO_DATA_ENV} or pass data_root to render the longitudinal neuro visuals."
+                ),
+            )
+        visualizations = payload.get("visualizations", {})
+        output_root = payload.get("source", {}).get("output_root")
+        patient_id = str(args.get("patient_id") or args.get("case_id") or payload.get("source", {}).get("patient_id") or "P28").strip().upper()
+        asset_root = str(
+            Path(output_root)
+            if output_root
+            else REPO_ROOT / ".clinagent" / "derived" / "neuro_longitudinal" / patient_id
+        )
+        compact = {
+            "id": payload.get("id"),
+            "title": payload.get("title"),
+            "dataset": payload.get("dataset"),
+            "risk_level": payload.get("analysis", {}).get("risk_level"),
+            "visualizations": visualizations,
+            "asset_paths": {
+                "trend_svg": f"{asset_root}/trend.svg",
+                "timeline_svg": f"{asset_root}/timeline.svg",
+                "comparison_svg": f"{asset_root}/comparison.svg",
+            },
+            "preview_assets": visualizations.get("preview_assets", []),
+            "comparison_panels": visualizations.get("comparison_panels", []),
+            "viewer_manifest": visualizations.get("viewer_manifest", {}),
+        }
+        return ToolResult(success=True, output=json.dumps(compact, indent=2))
+
+
+class NeuroLongitudinalViewerTool:
+    name = "get_neuro_longitudinal_viewer_manifest"
+    description = "Return the browser-viewable NiiVue manifest for a PROTEAS-backed longitudinal neuro case, including timepoints, overlay URLs, and the active display order."
+    parameters = {
+        "patient_id": {
+            "type": "string",
+            "description": "Optional PROTEAS patient id such as P28.",
+            "required": False,
+        },
+        "data_root": {
+            "type": "string",
+            "description": "Optional PROTEAS data root.",
+            "required": False,
+        },
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        payload = _build_neuro_workspace_payload({**args, "compact": False}, prefer_proteas=True)
+        if payload is None:
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    f"Configure {DEFAULT_NEURO_DATA_ENV} or pass data_root to render the longitudinal neuro viewer manifest."
+                ),
+            )
+        visualizations = payload.get("visualizations", {})
+        viewer = visualizations.get("viewer_manifest") or payload.get("viewer", {})
+        compact = {
+            "id": payload.get("id"),
+            "title": payload.get("title"),
+            "dataset": payload.get("dataset"),
+            "viewer": viewer,
+            "imaging_preview": payload.get("imaging_preview", {}),
+            "preview_assets": visualizations.get("preview_assets", []),
+            "comparison_panels": visualizations.get("comparison_panels", []),
+            "asset_paths": visualizations.get("asset_paths", {}),
+        }
+        return ToolResult(success=True, output=json.dumps(compact, indent=2))
+
+
+class NeuroVisualizationBundleTool:
+    name = "build_neuro_visualization_bundle"
+    description = "Build a NiiVue-ready neuro visualization bundle with slice previews, overlays, and a manifest for the selected case."
+    parameters = {
+        "patient_id": {
+            "type": "string",
+            "description": "Optional PROTEAS patient id such as P28.",
+            "required": False,
+        },
+        "case_id": {
+            "type": "string",
+            "description": "Optional neuro case id.",
+            "required": False,
+        },
+        "data_root": {
+            "type": "string",
+            "description": "Optional PROTEAS data root.",
+            "required": False,
+        },
+        "output_dir": {
+            "type": "string",
+            "description": "Optional output directory for the visual bundle.",
+            "required": False,
+        },
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        payload = _build_neuro_workspace_payload({**args, "compact": False}, prefer_proteas=True)
+        if payload is None:
+            case_id = args.get("case_id") or demo_workspace_store.snapshot()["default_case_id"]
+            payload = demo_workspace_store.get_case(case_id)
+        source = payload.get("source", {})
+        archive_path = source.get("archive_path")
+        if not archive_path:
+            return ToolResult(success=False, output="", error="No neuro archive path was available for the selected case.")
+        bundle = build_neuro_visualization_bundle(
+            archive_path=archive_path,
+            patient_id=str(args.get("patient_id") or source.get("patient_id") or payload.get("patient", {}).get("id") or "P28"),
+            timeline=list(payload.get("timeline", [])),
+            output_dir=str(
+                args.get("output_dir")
+                or source.get("output_root")
+                or REPO_ROOT / ".clinagent" / "derived" / "neuro_visuals"
+            ),
+            title=str(payload.get("title") or "Neuro longitudinal review"),
+        )
+        compact = {
+            "case_id": bundle.case_id,
+            "title": bundle.title,
+            "viewer": bundle.viewer,
+            "asset_root": bundle.asset_root,
+            "viewer_manifest": bundle.viewer_manifest,
+            "comparison_panels": bundle.comparison_panels,
+            "asset_paths": bundle.asset_paths,
+            "preview_assets": [asset.model_dump() for asset in bundle.preview_assets],
+        }
+        return ToolResult(success=True, output=json.dumps(compact, indent=2))
+
+
+class NeuroReportRendererTool:
+    name = "get_neuro_longitudinal_report"
+    description = "Return a compact, template-driven report bundle for the PROTEAS-backed longitudinal neuro case."
+    parameters = {
+        "patient_id": {
+            "type": "string",
+            "description": "Optional PROTEAS patient id such as P28.",
+            "required": False,
+        },
+        "data_root": {
+            "type": "string",
+            "description": "Optional PROTEAS data root.",
+            "required": False,
+        },
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        payload = _build_neuro_workspace_payload({**args, "compact": False}, prefer_proteas=True)
+        if payload is None:
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    f"Configure {DEFAULT_NEURO_DATA_ENV} or pass data_root to render the longitudinal neuro report."
+                ),
+            )
+        bundle = build_neuro_report_bundle(payload)
+        report_document = build_report_document_from_workspace(payload, default_title=bundle["title"])
+        target_dir = Path(payload.get("source", {}).get("output_root") or REPO_ROOT / ".clinagent" / "derived" / "reports" / payload.get("id", "neuro"))
+        exported = export_report_bundle(report_document, target_dir / "report", stem="report", export_pdf=True)
+        compact = {
+            **bundle,
+            "html_path": exported.html_path,
+            "json_path": exported.json_path,
+            "pdf_path": exported.pdf_path,
+            "pdf_supported": exported.pdf_supported,
+        }
+        return ToolResult(success=True, output=json.dumps(compact, indent=2))
+
+
+class NeuroLongitudinalSeriesCatalogTool:
+    name = "get_neuro_longitudinal_series_catalog"
+    description = "Return the series catalog and timepoint alignment for a PROTEAS-backed neuro longitudinal case."
+    parameters = {
+        "patient_id": {
+            "type": "string",
+            "description": "Optional PROTEAS patient id such as P28.",
+            "required": False,
+        },
+        "data_root": {
+            "type": "string",
+            "description": "Optional PROTEAS data root.",
+            "required": False,
+        },
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        payload = _build_neuro_workspace_payload({**args, "compact": False}, prefer_proteas=True)
+        if payload is None:
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    f"Configure {DEFAULT_NEURO_DATA_ENV} or pass data_root to inspect the longitudinal series catalog."
+                ),
+            )
+        compact = {
+            "id": payload.get("id"),
+            "title": payload.get("title"),
+            "patient": payload.get("patient"),
+            "analysis": payload.get("analysis", {}),
+            "timeline": payload.get("timeline", []),
+            "series_catalog": payload.get("series_catalog", []),
+            "radiomics": payload.get("radiomics", {}),
+        }
+        return ToolResult(success=True, output=json.dumps(compact, indent=2))
+
+
+class FindingsWorkspaceTool:
+    name = "get_findings_workspace"
+    description = "Return the current findings closure workspace, including the lead finding, closure state, and recommended actions."
+    parameters = {
+        "case_id": {
+            "type": "string",
+            "description": "Optional findings case id. Defaults to the main critical-lab demo case.",
+            "required": False,
+        }
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        case_id = args.get("case_id") or findings_closure_store.snapshot()["default_case_id"]
+        payload = findings_closure_store.get_case(case_id)
+        compact = {
+            "id": payload["id"],
+            "title": payload["title"],
+            "workflow_title": payload["workflow_title"],
+            "risk_label": payload["risk_label"],
+            "risk_reason": payload["risk_reason"],
+            "disposition": payload["disposition"],
+            "focus_metric": payload["focus_metric"],
+            "recommended_actions": payload["recommended_actions"],
+            "evidence_grid": payload["evidence_grid"],
+        }
+        return ToolResult(success=True, output=json.dumps(compact, indent=2))
+
+
+class QueueWorkspaceTool:
+    name = "get_queue_workspace"
+    description = "Return the current queue triage workspace, including urgency signal, queue recommendation, and recommended actions."
+    parameters = {
+        "case_id": {
+            "type": "string",
+            "description": "Optional queue case id. Defaults to the main referral triage demo case.",
+            "required": False,
+        }
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        case_id = args.get("case_id") or queue_triage_store.snapshot()["default_case_id"]
+        payload = queue_triage_store.get_case(case_id)
+        compact = {
+            "id": payload["id"],
+            "title": payload["title"],
+            "workflow_title": payload["workflow_title"],
+            "risk_label": payload["risk_label"],
+            "risk_reason": payload["risk_reason"],
+            "disposition": payload["disposition"],
+            "queue_recommendation": payload["queue_recommendation"],
+            "focus_metric": payload["focus_metric"],
+            "recommended_actions": payload["recommended_actions"],
+            "evidence_grid": payload["evidence_grid"],
+        }
+        return ToolResult(success=True, output=json.dumps(compact, indent=2))
+
+
+class DiagnosisWorkspaceTool:
+    name = "get_diagnosis_workspace"
+    description = "Return the current missed diagnosis workspace, including the gap signal, review recommendation, and key evidence."
+    parameters = {
+        "case_id": {
+            "type": "string",
+            "description": "Optional diagnosis case id. Defaults to the main missed vertebral fracture demo case.",
+            "required": False,
+        }
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        case_id = args.get("case_id") or missed_diagnosis_store.snapshot()["default_case_id"]
+        payload = missed_diagnosis_store.get_case(case_id)
+        compact = {
+            "id": payload["id"],
+            "title": payload["title"],
+            "workflow_title": payload["workflow_title"],
+            "risk_label": payload["risk_label"],
+            "risk_reason": payload["risk_reason"],
+            "disposition": payload["disposition"],
+            "gap_recommendation": payload["gap_recommendation"],
+            "focus_metric": payload["focus_metric"],
+            "recommended_actions": payload["recommended_actions"],
+            "evidence_grid": payload["evidence_grid"],
+        }
+        return ToolResult(success=True, output=json.dumps(compact, indent=2))
+
+
+class ScreeningWorkspaceTool:
+    name = "get_screening_workspace"
+    description = "Return the current screening gap workspace, including the gap signal, closure recommendation, and key evidence."
+    parameters = {
+        "case_id": {
+            "type": "string",
+            "description": "Optional screening case id. Defaults to the main positive FIT follow-up demo case.",
+            "required": False,
+        }
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        case_id = args.get("case_id") or screening_gap_store.snapshot()["default_case_id"]
+        payload = screening_gap_store.get_case(case_id)
+        compact = {
+            "id": payload["id"],
+            "title": payload["title"],
+            "workflow_title": payload["workflow_title"],
+            "risk_label": payload["risk_label"],
+            "risk_reason": payload["risk_reason"],
+            "disposition": payload["disposition"],
+            "gap_recommendation": payload["gap_recommendation"],
+            "focus_metric": payload["focus_metric"],
+            "recommended_actions": payload["recommended_actions"],
+            "evidence_grid": payload["evidence_grid"],
+        }
+        return ToolResult(success=True, output=json.dumps(compact, indent=2))
+
+
+class SafetyQueueTool:
+    name = "get_safety_queue"
+    description = "Return the current radiation safety queue summary and the incoming cases with risk tiers."
+    parameters: dict[str, dict[str, Any]] = {}
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        payload = safety_monitor_store.snapshot()
+        compact = {
+            "queue_summary": payload["queue_summary"],
+            "cases": payload["cases"],
+        }
+        return ToolResult(success=True, output=json.dumps(compact, indent=2))
+
+
+class SafetyCaseTool:
+    name = "get_safety_case"
+    description = "Return a specific safety case with intake, top match, mitigation playbook, review questions, and review state."
+    parameters = {
+        "case_id": {
+            "type": "string",
+            "description": "Safety case id to inspect. Defaults to the first incoming case.",
+            "required": False,
+        }
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        case_id = args.get("case_id") or safety_monitor_store.snapshot()["default_case_id"]
+        payload = safety_monitor_store.get_case(case_id)
+        compact = {
+            "id": payload["id"],
+            "title": payload["title"],
+            "risk_label": payload["risk_label"],
+            "risk_reason": payload["risk_reason"],
+            "fields": payload["fields"],
+            "playbook": payload["playbook"],
+            "review_questions": payload["review_questions"],
+            "matched_incidents": payload["matched_incidents"][:3],
+            "review": payload["review"],
+        }
+        return ToolResult(success=True, output=json.dumps(compact, indent=2))
+
+
+class SafetyKnowledgeSearchTool:
+    name = "search_safety_knowledge"
+    description = "Search the local radiation safety knowledge base for failure modes relevant to a query."
+    parameters = {
+        "query": {
+            "type": "string",
+            "description": "User query or short description of a safety concern.",
+            "required": True,
+        }
+    }
+    cacheable = True
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        query = (args.get("query") or "").lower()
+        if not query:
+            return ToolResult(success=False, output="", error="query is required")
+        ranked: list[dict[str, Any]] = []
+        for item in KNOWLEDGE_BASE:
+            haystack = " ".join(
+                [
+                    item["title"],
+                    item["summary"],
+                    item["category"],
+                    item["process_step"],
+                    " ".join(item["signals"]),
+                    " ".join(item["tags"]),
+                ]
+            ).lower()
+            score = sum(1 for token in query.split() if token and token in haystack)
+            if score:
+                ranked.append(
+                    {
+                        "id": item["id"],
+                        "title": item["title"],
+                        "category": item["category"],
+                        "process_step": item["process_step"],
+                        "score": score,
+                        "source": item["source"],
+                    }
+                )
+        ranked.sort(key=lambda entry: entry["score"], reverse=True)
+        return ToolResult(success=True, output=json.dumps(ranked[:5], indent=2))
+
+
+def _extract_json(content: str) -> dict[str, Any] | None:
+    text = content.strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(text[start : end + 1])
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
+ROUTER_WORKFLOW_IDS = {
+    "general_chat",
+    "report_quality_review",
+    "findings_closure",
+    "queue_triage",
+    "missed_diagnosis_detection",
+    "screening_gap_closure",
+    "neuro_longitudinal",
+    "neuro_report",
+    "radonc_plan_optimization",
+    "radiation_safety_monitor",
+}
+
+ROUTER_MODULE_MAP = {
+    "general_chat": "home",
+    "report_quality_review": "report_quality",
+    "findings_closure": "findings",
+    "queue_triage": "queue",
+    "missed_diagnosis_detection": "diagnosis",
+    "screening_gap_closure": "screening",
+    "neuro_longitudinal": "neuro",
+    "neuro_report": "neuro_report",
+    "radonc_plan_optimization": "radonc_plan",
+    "radiation_safety_monitor": "safety",
+}
+
+ROUTER_INTENT_LABELS = {
+    "general_chat": "General clinical intake",
+    "report_quality_review": "Report quality review",
+    "findings_closure": "Findings closure",
+    "queue_triage": "Queue triage",
+    "missed_diagnosis_detection": "Missed diagnosis review",
+    "screening_gap_closure": "Screening gap closure",
+    "neuro_longitudinal": "Neuro longitudinal review",
+    "neuro_report": "Neuro MRI review",
+    "radonc_plan_optimization": "RadOnc plan optimization",
+    "radiation_safety_monitor": "Radiation safety monitor",
+}
+
+_SMALLTALK_PATTERNS = {
+    "hi",
+    "hello",
+    "hey",
+    "yo",
+    "thanks",
+    "thank you",
+    "good morning",
+    "good afternoon",
+    "good evening",
+    "how are you",
+    "who are you",
+    "what can you do",
+}
+
+_SMALLTALK_DIRECT_REPLIES = {
+    "hi": "Hi. How can I help?",
+    "hello": "Hello. How can I help?",
+    "hey": "Hey. How can I help?",
+    "yo": "Hi. How can I help?",
+    "good morning": "Good morning. How can I help?",
+    "good afternoon": "Good afternoon. How can I help?",
+    "good evening": "Good evening. How can I help?",
+    "thanks": "You're welcome.",
+    "thank you": "You're welcome.",
+    "how are you": "Doing well. How can I help?",
+}
+
+
+def _normalize_confidence(value: Any) -> float:
+    try:
+        confidence = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(confidence, 1.0))
+
+
+def _normalized_message(message: str) -> str:
+    return " ".join(str(message or "").strip().lower().split())
+
+
+def _is_smalltalk_message(message: str) -> bool:
+    normalized = _normalized_message(message)
+    if not normalized:
+        return False
+    if normalized in _SMALLTALK_PATTERNS:
+        return True
+    if len(normalized.split()) <= 3 and any(token in normalized for token in ("hi", "hello", "hey")):
+        return True
+    return False
+
+
+def get_smalltalk_reply(message: str) -> str | None:
+    normalized = _normalized_message(message)
+    if not _is_smalltalk_message(normalized):
+        return None
+    return _SMALLTALK_DIRECT_REPLIES.get(normalized, "Hi. How can I help?")
+
+
+def _build_router_alternatives(
+    workflow_id: str,
+    parsed_alternatives: list[Any],
+    heuristic_alternatives: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    alternatives: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for alt in parsed_alternatives:
+        if alt in ROUTER_WORKFLOW_IDS and alt != workflow_id:
+            alt_wf = next(item for item in WORKFLOWS if item["id"] == alt)
+            if alt_wf["module"] in seen:
+                continue
+            alternatives.append({"module": alt_wf["module"], "title": alt_wf["title"]})
+            seen.add(alt_wf["module"])
+    if alternatives:
+        return alternatives[:2]
+    for item in heuristic_alternatives:
+        if item["workflow_id"] == workflow_id or item["module"] in seen:
+            continue
+        alternatives.append({"module": item["module"], "title": item["title"]})
+        seen.add(item["module"])
+        if len(alternatives) == 2:
+            break
+    return alternatives
+
+
+def _semantic_supports_route(
+    workflow_id: str,
+    semantic_candidates: list[dict[str, Any]],
+    *,
+    threshold: float = 0.17,
+) -> bool:
+    for candidate in semantic_candidates:
+        if candidate["workflow_id"] == workflow_id:
+            return float(candidate.get("score") or 0.0) >= threshold
+    return False
+
+
+def _build_route_payload(
+    workflow_id: str,
+    *,
+    confidence: float,
+    reason: str,
+    next_action: str,
+    alternatives: list[dict[str, str]] | None = None,
+    intent_label: str | None = None,
+    needs_clarification: bool = False,
+    clarification_question: str | None = None,
+    missing_slots: list[str] | None = None,
+    fallback: bool = False,
+) -> dict[str, Any]:
+    workflow = next(item for item in WORKFLOWS if item["id"] == workflow_id)
+    suggested_module = ROUTER_MODULE_MAP[workflow_id] if workflow_id != "general_chat" else None
+    target_module = "home" if needs_clarification else ROUTER_MODULE_MAP[workflow_id]
+    return {
+        "workflow_id": workflow_id,
+        "workflow": workflow,
+        "target_module": target_module,
+        "suggested_module": suggested_module,
+        "confidence": confidence,
+        "reason": reason,
+        "next_action": next_action,
+        "alternatives": alternatives or [],
+        "intent_label": intent_label or ROUTER_INTENT_LABELS.get(workflow_id, workflow["title"]),
+        "needs_clarification": needs_clarification,
+        "clarification_question": clarification_question,
+        "missing_slots": missing_slots or [],
+        "fallback": fallback,
+    }
+
+
+def _continue_session_workflow_payload(
+    session_state: dict[str, Any] | None,
+    *,
+    confidence: float,
+    reason: str,
+    next_action: str,
+    fallback: bool,
+) -> dict[str, Any] | None:
+    if not session_state:
+        return None
+    continued_workflow_id = str(session_state.get("active_workflow_id") or "").strip()
+    if continued_workflow_id not in ROUTER_WORKFLOW_IDS or continued_workflow_id == "general_chat":
+        return None
+    return _build_route_payload(
+        continued_workflow_id,
+        confidence=confidence,
+        reason=reason,
+        next_action=next_action,
+        intent_label=ROUTER_INTENT_LABELS.get(continued_workflow_id),
+        fallback=fallback,
+    )
+
+
+def _semantic_fallback_route(
+    semantic_candidates: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    top_candidate = semantic_candidates[0] if semantic_candidates else None
+    top_score = float((top_candidate or {}).get("score") or 0.0)
+    second_score = float((semantic_candidates[1] or {}).get("score") or 0.0) if len(semantic_candidates) > 1 else 0.0
+    if not top_candidate:
+        return None
+
+    workflow_id = str(top_candidate["workflow_id"])
+    minimum_score = 0.15 if workflow_id == "general_chat" else 0.12
+    if top_score < minimum_score or (top_score - second_score) < 0.015:
+        return None
+
+    alternatives = [
+        {"module": item["module"], "title": item["title"]}
+        for item in semantic_candidates[1:3]
+        if item["workflow_id"] != workflow_id
+    ]
+    return _build_route_payload(
+        workflow_id,
+        confidence=min(0.88, max(0.58, top_score + 0.28)),
+        reason=f"Semantic routing matched this request to {top_candidate['title']}.",
+        next_action="Continue with the matched workflow in chat." if workflow_id != "general_chat" else "Respond directly in chat.",
+        alternatives=alternatives,
+        fallback=True,
+    )
+
+
+def _build_clarification_question(
+    workflow_id: str,
+    alternatives: list[dict[str, str]],
+    parsed_question: Any,
+    missing_slots: list[str],
+) -> str:
+    if isinstance(parsed_question, str) and parsed_question.strip():
+        return parsed_question.strip()
+    if missing_slots:
+        slot_text = ", ".join(missing_slots[:2])
+        if workflow_id != "general_chat":
+            return (
+                f"I can take this toward {ROUTER_INTENT_LABELS.get(workflow_id, 'the right workflow')}, "
+                f"but I need one detail first: {slot_text}."
+            )
+        return f"I need one detail before routing this: {slot_text}."
+    if alternatives:
+        option_text = " or ".join(item["title"] for item in alternatives[:2] if item.get("title"))
+        if option_text:
+            return f"Should I treat this as {option_text}, or do you want a general clinical discussion first?"
+    if workflow_id != "general_chat":
+        return f"I can route this toward {ROUTER_INTENT_LABELS.get(workflow_id, workflow_id)}, but I need one clarifying detail before I proceed."
+    return "I can help, but I need one more detail about the workflow or output you want."
+
+
+async def route_with_llm(
+    llm: LLMProvider,
+    message: str,
+    ingest_context: dict[str, Any] | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    if _is_smalltalk_message(message):
+        return _build_route_payload(
+            "general_chat",
+            confidence=0.98,
+            reason="Detected a general chat or smalltalk message.",
+            next_action="Respond directly in chat.",
+        )
+
+    routing_message = augment_message_with_ingest_context(message, ingest_context)
+    session_state = load_session_intent_state(session_id)
+    ranked = rank_workflows(message, ingest_context=ingest_context)
+    heuristic_alternatives = [
+        {
+            "workflow_id": item["workflow"]["id"],
+            "module": item["module"],
+            "title": item["workflow"]["title"],
+            "score": item["score"],
+        }
+        for item in ranked
+        if item["score"] > 0
+    ]
+    semantic_candidates = retrieve_semantic_workflow_candidates(message, ingest_context, top_k=4)
+    if should_bias_to_session_workflow(message, session_state):
+        active_workflow_id = str(session_state.get("active_workflow_id") or "").strip()
+        active_workflow = next((item for item in semantic_candidates if item["workflow_id"] == active_workflow_id), None)
+        if active_workflow:
+            active_workflow["score"] = round(float(active_workflow["score"]) + 0.12, 4)
+        else:
+            workflow = next((item for item in WORKFLOWS if item["id"] == active_workflow_id), None)
+            if workflow:
+                semantic_candidates.append(
+                    {
+                        "workflow_id": workflow["id"],
+                        "module": workflow["module"],
+                        "title": workflow["title"],
+                        "score": 0.18,
+                    }
+                )
+        semantic_candidates.sort(key=lambda item: float(item["score"]), reverse=True)
+
+    heuristic_hint = "\n".join(
+        f"- {item['workflow_id']} ({item['title']}): heuristic score {item['score']}"
+        for item in heuristic_alternatives[:3]
+    ) or "- no strong heuristic match"
+    semantic_hint = "\n".join(
+        f"- {item['workflow_id']} ({item['title']}): vector score {item['score']}"
+        for item in semantic_candidates[:3]
+    ) or "- no strong semantic match"
+    system_prompt = (
+        "You are the ClinAgent router. "
+        "Classify the user's request into one workflow_id from "
+        "general_chat, report_quality_review, findings_closure, queue_triage, missed_diagnosis_detection, screening_gap_closure, neuro_longitudinal, neuro_report, radonc_plan_optimization, radiation_safety_monitor. "
+        "Return strict JSON with keys: workflow_id, intent_label, confidence, reason, next_action, alternatives, needs_clarification, clarification_question, missing_slots. "
+        "alternatives must be an array of 0-2 workflow_id values that are also plausible. "
+        "needs_clarification must be true when the user likely intends a workflow but is missing one critical detail. "
+        "missing_slots must be an array of short phrases. "
+        "confidence must be between 0 and 1. "
+        "If uncertain, choose general_chat."
+    )
+    user_prompt = (
+        "User request:\n"
+        f"{message}\n\n"
+        f"Additional upload context:\n{routing_message[len(message):].strip() or 'None'}\n\n"
+        "Conversation state:\n"
+        f"{build_session_router_context(session_state)}\n\n"
+        "Heuristic candidates:\n"
+        f"{heuristic_hint}\n\n"
+        "Vector similarity candidates:\n"
+        f"{semantic_hint}\n\n"
+        "Workflow boundaries:\n"
+        "- neuro_report: flagship neuro workspace for structural MRI reporting, segmentation overlay, volumetrics, longitudinal response review, lesion/tumor follow-up, and neuro report review when tied to a case\n"
+        "- neuro_longitudinal: legacy neuro-oncology longitudinal workspace kept mainly for compatibility and deeper response evidence tools\n"
+        "- report_quality_review: standalone report draft QA, identifier review, terminology review, compliance template review, radiology report quality when not tied to a specific neuro case\n"
+        "- findings_closure: critical lab, positive result follow-up, actionable report finding, abnormal pap, suspicious nodule\n"
+        "- queue_triage: referral urgency, queue reprioritization, post-discharge follow-up triage, same-day review, outreach queue\n"
+        "- missed_diagnosis_detection: missed fracture workup, vertebral fracture gap, unrecognized condition, undiagnosed condition\n"
+        "- screening_gap_closure: screening follow-up gap, positive FIT, overdue colonoscopy, preventive care gap, open screening follow-up\n"
+        "- radonc_plan_optimization: radiation oncology treatment planning optimization, DVH review, objective trade-offs, OAR sparing versus target coverage, auto-loop planning\n"
+        "- radiation_safety_monitor: incident, QA, alert, radiation, dosimetry, timeout, adaptive planning\n"
+        "- general_chat: anything else or uncertain\n"
+    )
+    try:
+        response = await llm.chat(
+            [
+                LLMMessage(role="system", content=system_prompt),
+                LLMMessage(role="user", content=user_prompt),
+            ]
+        )
+        parsed = _extract_json(response.content)
+        if parsed and parsed.get("workflow_id") in ROUTER_WORKFLOW_IDS:
+            workflow_id = parsed["workflow_id"]
+            workflow = next(item for item in WORKFLOWS if item["id"] == workflow_id)
+            confidence = _normalize_confidence(parsed.get("confidence", 0.0))
+            suggested_module = ROUTER_MODULE_MAP[workflow_id] if workflow_id != "general_chat" else None
+            parsed_alternatives = list(parsed.get("alternatives") or [])
+            alternatives = _build_router_alternatives(workflow_id, parsed_alternatives, heuristic_alternatives)
+            missing_slots = [
+                str(item).strip()
+                for item in (parsed.get("missing_slots") or [])
+                if str(item).strip()
+            ][:3]
+            heuristic_best = heuristic_alternatives[0] if heuristic_alternatives else None
+            heuristic_score = int(heuristic_best["score"]) if heuristic_best else 0
+            heuristic_supports_route = bool(
+                heuristic_best
+                and heuristic_best["workflow_id"] == workflow_id
+                and heuristic_score >= 2
+            )
+            semantic_supports_route = _semantic_supports_route(workflow_id, semantic_candidates)
+            if workflow_id != "general_chat" and confidence < 0.6 and not heuristic_supports_route and not semantic_supports_route:
+                return _build_route_payload(
+                    "general_chat",
+                    confidence=confidence,
+                    reason="No strong workflow match. Respond in general chat.",
+                    next_action="Respond directly in chat.",
+                )
+            if (
+                workflow_id == "general_chat"
+                and should_bias_to_session_workflow(message, session_state)
+                and session_state
+            ):
+                continued = _continue_session_workflow_payload(
+                    session_state,
+                    confidence=max(confidence, 0.72),
+                    reason="Continuing the active workflow from recent conversation context.",
+                    next_action="Continue the current workflow in chat.",
+                    fallback=False,
+                )
+                if continued:
+                    return continued
+            needs_clarification = bool(parsed.get("needs_clarification"))
+            clarification_question = _build_clarification_question(
+                workflow_id,
+                alternatives,
+                parsed.get("clarification_question"),
+                missing_slots,
+            ) if needs_clarification else None
+            return _build_route_payload(
+                workflow_id,
+                confidence=confidence,
+                reason=str(parsed.get("reason", "Router selected the closest workflow.")),
+                next_action=str(parsed.get("next_action", "Open the selected module.")),
+                alternatives=alternatives,
+                intent_label=str(parsed.get("intent_label") or ROUTER_INTENT_LABELS.get(workflow_id) or workflow["title"]),
+                needs_clarification=needs_clarification,
+                clarification_question=clarification_question,
+                missing_slots=missing_slots,
+                fallback=False,
+            )
+    except Exception:
+        pass
+
+    continued = None
+    if should_bias_to_session_workflow(message, session_state):
+        continued = _continue_session_workflow_payload(
+            session_state,
+            confidence=max(float((session_state or {}).get("last_confidence") or 0.0), 0.7),
+            reason="Continuing the active workflow from recent conversation context after router fallback.",
+            next_action="Continue the current workflow in chat.",
+            fallback=True,
+        )
+    if continued:
+        return continued
+
+    semantic_fallback = _semantic_fallback_route(semantic_candidates)
+    if semantic_fallback:
+        return semantic_fallback
+
+    fallback = route_general_query(message, ingest_context=ingest_context)
+    workflow = fallback["workflow"]
+    suggested_module = fallback["target_module"] if fallback["target_module"] != "home" else None
+    fallback_alternatives = [
+        {"module": item["module"], "title": item["title"]}
+        for item in fallback.get("alternatives", [])
+    ]
+    return {
+        "workflow_id": workflow["id"],
+        "workflow": workflow,
+        "target_module": fallback["target_module"],
+        "suggested_module": suggested_module,
+        "confidence": 0.0,
+        "reason": fallback["assistant"]["content"],
+        "next_action": "Respond directly in chat.",
+        "alternatives": fallback_alternatives,
+        "intent_label": ROUTER_INTENT_LABELS.get(workflow["id"], workflow["title"]),
+        "needs_clarification": False,
+        "clarification_question": None,
+        "missing_slots": [],
+        "fallback": True,
+    }
+
+
+def build_console_agent(llm: LLMProvider, workflow_id: str = "general_chat"):
+    profile = get_execution_profile(workflow_id)
+    tools = [
+        WorkflowCatalogTool(),
+        ClinicalReportGeneratorTool(),
+        FindingsWorkspaceTool(),
+        QueueWorkspaceTool(),
+        DiagnosisWorkspaceTool(),
+        ScreeningWorkspaceTool(),
+        NeuroWorkspaceTool(),
+        NeuroLongitudinalWorkspaceTool(),
+        NeuroLongitudinalVisualsTool(),
+        NeuroLongitudinalViewerTool(),
+        NeuroVisualizationBundleTool(),
+        NeuroReportRendererTool(),
+        NeuroLongitudinalSeriesCatalogTool(),
+        DicomSeriesSelectorTool(),
+        SearchNeuroKnowledgeTool(),
+        NeuroKnowledgeCaseTool(),
+        NeuroKnowledgeCaseAssetsTool(),
+        NeuroKnowledgeStudyTool(),
+        NeuroKnowledgeCohortTool(),
+        BrainSegServiceHealthTool(),
+        BrainStructureModelInfoTool(),
+        RunBrainStructureSegmentationTool(),
+        CoregisterNeuroSequencesTool(),
+        ApplyNeuroTransformTool(),
+        CoregisterNeuroLongitudinalTool(),
+        DeepPrepToolHealthTool(),
+        RunDeepPrepPreprocessingTool(),
+        BrainTumorSegServiceHealthTool(),
+        BrainTumorSegModelInfoTool(),
+        RunBrainTumorSegmentationTool(),
+        BrainMetResponseTrackerTool(),
+        RTTimelineAlignerTool(),
+        SlicePreviewRendererTool(),
+        LesionTrendPlotterTool(),
+        TreatmentEventTimelineRendererTool(),
+        KeySliceSelectorTool(),
+        OverlayComposerTool(),
+        LongitudinalComparisonPanelBuilderTool(),
+        RiskSignalRendererTool(),
+        SafetyQueueTool(),
+        SafetyCaseTool(),
+        SafetyKnowledgeSearchTool(),
+    ]
+    if workflow_id == "general_chat":
+        instruction = (
+            "You are the ClinAgent general chat agent. "
+            "Respond naturally and directly to the user. "
+            "Do not recommend a workflow unless the user explicitly asks for one or there is a very strong concrete reason. "
+            "Use tools only if they clearly improve the answer. "
+            "Do not expose internal routing or tool policy details. "
+            "Be concise, grounded, and conversational."
+        )
+    else:
+        instruction = (
+            "You are the ClinAgent console agent. "
+            "Help the user accomplish clinical workflow tasks using the available tools. "
+            "Be concise, grounded, and operational. "
+            f"The active workflow profile is {profile.workflow_id} on lane {profile.default_lane}. "
+            f"The declared subagent roles for this run are: {', '.join(profile.subagents)}. "
+            "Before producing any user-facing report, summary, or polished chat answer, you must first call "
+            "use_skill for the required presentation skill or skills. "
+            "Always load clinical_report_presentation first. "
+            "If you are generating a reusable report artifact, also load clinical_report_generator. "
+            "If the workflow is findings_closure, also load findings_brief_presenter. "
+            "If the workflow is queue_triage, also load queue_triage_presenter. "
+            "If the workflow is missed_diagnosis_detection, also load missed_diagnosis_presenter. "
+            "If the workflow is screening_gap_closure, also load screening_gap_presenter. "
+            "If the workflow is neuro_longitudinal, also load clinical_report_generator, neuro_report_generator, neuro_visualization_presenter, and neuro_report_presenter, and use the longitudinal neuro tools to inspect series selection, risk signal, trend, timeline, viewer assets, and the rendered report bundle. "
+            "If the workflow is radiation_safety_monitor, also load safety_brief_presenter. "
+            "Silently organize your facts before writing, but never reveal hidden planning or chain-of-thought. "
+            "For neuro requests, inspect the neuro workspace before answering. "
+            "If neuro case context is incomplete or a research-case lookup would help, use the neuro knowledge cohort, search, case, study, or assets tools through the gateway. "
+            "For neuro sequence alignment or mask transfer requests, use coregister_neuro_sequences first, then apply_neuro_transform with nearest interpolation for masks or segmentations. "
+            "For longitudinal follow-up alignment, use coregister_neuro_longitudinal and keep nonlinear deformation disabled unless explicitly configured by a future validated backend. "
+            "For neuro preprocessing, DeepPrep, or co-registration requests, load deepprep_neuro_preprocessing_tool, check DeepPrep health first, and dry-run before launching a long remote job unless the user explicitly asked to execute with exact server paths. "
+            "For findings-closure requests, inspect the findings workspace before answering. "
+            "For queue triage requests, inspect the queue workspace before answering. "
+            "For missed diagnosis requests, inspect the diagnosis workspace before answering. "
+            "For screening gap requests, inspect the screening workspace before answering. "
+            "For safety requests, inspect the safety queue or a safety case before answering. "
+            "Do not invent patient data or incident details. "
+            "Do not expose internal tool names or routing details in the final answer. "
+            "Summarize what you found and recommend the next action clearly."
+        )
+    agent = create_agent(
+        model=llm,
+        instruction=instruction,
+        tools=tools,
+        skills=SKILLS_DIRS or [SKILLS_DIR],
+        streaming=True,
+    )
+    agent.allow_only_tools(*profile.allowed_tools)
+    return agent
+
+
+def build_routed_task(route: dict[str, Any], message: str) -> str:
+    workflow_id = route["workflow_id"]
+    if workflow_id == "report_quality_review":
+        return (
+            "Workflow: report_quality_review\n"
+            "Required pre-answer tool calls:\n"
+            "1. use_skill(name='clinical_report_presentation')\n"
+            "2. use_skill(name='clinical_report_generator')\n"
+            "Present the final answer as a compact report-quality brief with sections for Privacy, Terminology, Completeness, and Next Step.\n"
+            f"User request: {message}"
+        )
+    if workflow_id == "findings_closure":
+        return (
+            "Workflow: findings_closure\n"
+            "Required pre-answer tool calls:\n"
+            "1. use_skill(name='clinical_report_presentation')\n"
+            "2. use_skill(name='findings_brief_presenter')\n"
+            "Use the findings workspace tool to inspect the current case before answering.\n"
+            "Present the final answer as a polished findings closure brief with sections for Finding Summary, "
+            "Closure Check, Recommended Next Step, and Review Status.\n"
+            f"User request: {message}"
+        )
+    if workflow_id == "queue_triage":
+        return (
+            "Workflow: queue_triage\n"
+            "Required pre-answer tool calls:\n"
+            "1. use_skill(name='clinical_report_presentation')\n"
+            "2. use_skill(name='queue_triage_presenter')\n"
+            "Use the queue workspace tool to inspect the current case before answering.\n"
+            "Present the final answer as a compact triage brief with sections for Queue Signal, Priority Shift, "
+            "Recommended Queue Move, and Review Status.\n"
+            f"User request: {message}"
+        )
+    if workflow_id == "missed_diagnosis_detection":
+        return (
+            "Workflow: missed_diagnosis_detection\n"
+            "Required pre-answer tool calls:\n"
+            "1. use_skill(name='clinical_report_presentation')\n"
+            "2. use_skill(name='missed_diagnosis_presenter')\n"
+            "Use the diagnosis workspace tool to inspect the current case before answering.\n"
+            "Present the final answer as a compact missed-diagnosis brief with sections for Gap Signal, "
+            "Follow-up Check, Recommended Workup, and Review Status.\n"
+            f"User request: {message}"
+        )
+    if workflow_id == "screening_gap_closure":
+        return (
+            "Workflow: screening_gap_closure\n"
+            "Required pre-answer tool calls:\n"
+            "1. use_skill(name='clinical_report_presentation')\n"
+            "2. use_skill(name='screening_gap_presenter')\n"
+            "Use the screening workspace tool to inspect the current case before answering.\n"
+            "Present the final answer as a compact screening-gap brief with sections for Screening Signal, "
+            "Gap Check, Recommended Next Step, and Review Status.\n"
+            f"User request: {message}"
+        )
+    if workflow_id == "neuro_longitudinal":
+        return (
+            "Workflow: neuro_longitudinal\n"
+            "This is a legacy compatibility workflow. Prefer neuro_report family handoff for new user-facing neuro requests unless the caller explicitly needs the legacy longitudinal workspace.\n"
+            "Required pre-answer tool calls:\n"
+            "1. use_skill(name='clinical_report_presentation')\n"
+            "2. use_skill(name='clinical_report_generator')\n"
+            "3. use_skill(name='neuro_report_generator')\n"
+            "4. use_skill(name='neuro_visualization_presenter')\n"
+            "5. use_skill(name='neuro_report_presenter')\n"
+            "6. get_neuro_longitudinal_workspace(...)\n"
+            "7. get_neuro_longitudinal_viewer_manifest(...)\n"
+            "8. build_neuro_visualization_bundle(...)\n"
+            "9. get_neuro_longitudinal_report(...)\n"
+            "Use the neuro longitudinal workspace tools to inspect the case before answering.\n"
+            "Inspect the rendered neuro report bundle and the viewer manifest before drafting the final brief.\n"
+            "Present the final answer as a polished clinician-facing markdown brief with sections for MRI Trend Analysis, "
+            "Draft Physician Summary, Recommendations, and a one-line Risk Tier.\n"
+            f"User request: {message}"
+        )
+    if workflow_id == "neuro_report":
+        return (
+            "Workflow: neuro_report\n"
+            "This request belongs in the Neuro MRI Report Generator family workspace.\n"
+            "Treat neuro_report as the umbrella family for structural MRI review, longitudinal response review, and case-scoped report review.\n"
+            "You may use the neuro knowledge search, cohort, case, study, and case-assets tools when case context must be resolved before opening or summarizing the workspace.\n"
+            "Do not run the generic workflow agent path for this task. "
+            "Instead, open the MRI report workspace with the shared chat context intact.\n"
+            f"User request: {message}"
+        )
+    if workflow_id == "radonc_plan_optimization":
+        return (
+            "Workflow: radonc_plan_optimization\n"
+            "This request belongs in the RadOnc plan optimization family workspace.\n"
+            "Treat radonc_plan_optimization as the flagship radiation treatment-planning loop for DVH review, objective trade-offs, and controlled TPS write-back.\n"
+            "Do not run the generic workflow agent path for this task. "
+            "Instead, open the RadOnc planning workspace with the shared chat context intact.\n"
+            f"User request: {message}"
+        )
+    if workflow_id == "radiation_safety_monitor":
+        return (
+            "Workflow: radiation_safety_monitor\n"
+            "Required pre-answer tool calls:\n"
+            "1. use_skill(name='clinical_report_presentation')\n"
+            "2. use_skill(name='safety_brief_presenter')\n"
+            "Use the safety queue and safety case tools before answering. "
+            "If incident pattern matching is relevant, search the local safety knowledge base.\n"
+            "Present the final answer as a polished clinical operations brief with sections for Risk Summary, "
+            "Matched Failure Patterns, Recommended Checks, and a one-line Escalation.\n"
+            f"User request: {message}"
+        )
+    return (
+        "Workflow: general_chat\n"
+        "Default to a direct conversational answer.\n"
+        "If the user is just greeting you or making smalltalk, reply in one short sentence.\n"
+        "Do not enumerate product capabilities unless the user asks what you can do.\n"
+        "Do not recommend a workflow unless the user explicitly asks for one or there is a very strong, concrete workflow match.\n"
+        "Use the workflow catalog and any relevant module tool only if it clearly improves the answer.\n"
+        "Keep the final answer concise and product-ready, without exposing internal tool or routing names.\n"
+        f"User request: {message}"
+    )

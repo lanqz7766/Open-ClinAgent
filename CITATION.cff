@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use ClinAgent in your work, please cite it as below."
+title: "ClinAgent: A Clinical AI Agent Platform for Structured, Review-Ready Imaging Workflows"
+type: software
+authors:
+  - family-names: Lan
+    given-names: Qizhen
+version: 0.2.1
+date-released: 2026-11-10
+license: MIT
+repository-code: "https://github.com/lanqz7766/Open-ClinAgent"
+url: "https://github.com/lanqz7766/Open-ClinAgent"
+keywords:
+  - clinical AI
+  - medical imaging
+  - AI agents
+  - neuro-oncology
+  - radiology

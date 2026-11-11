@@ -1,0 +1,607 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+from datetime import UTC, datetime
+
+from clinagent.platform.models import (
+    AccessAction,
+    AccessOutcome,
+    AccessEventRecord,
+    ArtifactRecord,
+    ArtifactStatus,
+    ArtifactType,
+    CaseRecord,
+    CreateTaskRunRequest,
+    RunMemoryRecord,
+    ScenarioSpec,
+    SmartLaunchSessionRecord,
+    SmartTokenStateRecord,
+    TaskRunRecord,
+    TaskRunStatus,
+)
+
+
+def utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+class MemoryStore:
+    def __init__(self) -> None:
+        self.cases: dict[str, CaseRecord] = {}
+        self.tasks: dict[str, TaskRunRecord] = {}
+        self.artifacts: dict[str, ArtifactRecord] = {}
+        self.access_events: dict[str, AccessEventRecord] = {}
+        self.run_memories: dict[str, RunMemoryRecord] = {}
+        self.user_memories: dict[str, dict[str, object]] = {}
+        self.session_memories: dict[str, dict[str, object]] = {}
+        self.workflow_memories: dict[tuple[str, str], dict[str, object]] = {}
+        self.entity_memories: dict[tuple[str, str], dict[str, object]] = {}
+        self.proposed_pattern_memories: dict[tuple[str, str], dict[str, object]] = {}
+        self.reviewed_pattern_memories: dict[tuple[str, str], dict[str, object]] = {}
+        self.smart_launch_sessions: dict[str, SmartLaunchSessionRecord] = {}
+        self.smart_token_states: dict[str, SmartTokenStateRecord] = {}
+
+    def bootstrap_demo_data(self, scenarios: list[ScenarioSpec]) -> None:
+        if self.cases:
+            return
+
+        demo_case = CaseRecord(
+            external_patient_id="demo-patient-001",
+            encounter_id="encounter-demo-001",
+            scenario_ids=[scenario.id for scenario in scenarios],
+            metadata={"source": "week-1-shell"},
+        )
+        self.cases[demo_case.id] = demo_case
+
+        if scenarios:
+            first = scenarios[0]
+            demo_task = TaskRunRecord(
+                case_id=demo_case.id,
+                scenario_id=first.id,
+                requested_by="system-bootstrap",
+                status=TaskRunStatus.in_review,
+                note="Demo task for platform shell",
+                policy_snapshot=first.policy,
+                review_required=first.review.required,
+                metadata={"demo": True},
+            )
+            self.tasks[demo_task.id] = demo_task
+
+        demo_artifact = ArtifactRecord(
+            case_id=demo_case.id,
+            artifact_type=ArtifactType.json,
+            title="Shell platform manifest",
+            path=".clinagent/artifacts/demo_manifest.json",
+            status=ArtifactStatus.in_review,
+            metadata={"status": "placeholder"},
+        )
+        self.artifacts[demo_artifact.id] = demo_artifact
+
+        demo_access = AccessEventRecord(
+            case_id=demo_case.id,
+            system="shell-platform",
+            action=AccessAction.launch,
+            resource_type="PlatformSession",
+            resource_id="bootstrap",
+            outcome=AccessOutcome.success,
+            details={"note": "Week 1 bootstrap event"},
+        )
+        self.access_events[demo_access.id] = demo_access
+
+    def create_case_if_needed(self, request: CreateTaskRunRequest, scenarios: dict[str, ScenarioSpec]) -> str:
+        if request.case_id:
+            return request.case_id
+
+        scenario = scenarios[request.scenario_id]
+        case_record = CaseRecord(
+            external_patient_id=request.external_patient_id,
+            scenario_ids=[scenario.id],
+            metadata={"created_from": "task_request"},
+        )
+        self.cases[case_record.id] = case_record
+        return case_record.id
+
+    def create_task(self, request: CreateTaskRunRequest, scenarios: dict[str, ScenarioSpec]) -> TaskRunRecord:
+        case_id = self.create_case_if_needed(request, scenarios)
+        scenario = scenarios[request.scenario_id]
+        task = TaskRunRecord(
+            case_id=case_id,
+            scenario_id=scenario.id,
+            requested_by=request.requested_by,
+            note=request.note,
+            policy_snapshot=scenario.policy,
+            review_required=scenario.review.required,
+            metadata={"scenario_name": scenario.name},
+        )
+        self.tasks[task.id] = task
+        return task
+
+    def update_task_status(self, task_id: str, status: str, note: str | None = None) -> TaskRunRecord:
+        task = self.tasks[task_id]
+        task.status = TaskRunStatus(status)
+        task.updated_at = utc_now()
+        if note is not None:
+            task.note = note
+        self._sync_artifact_statuses(task)
+        return task
+
+    def get_task(self, task_id: str) -> TaskRunRecord | None:
+        return self.tasks.get(task_id)
+
+    def list_tasks_by_status(self, status: TaskRunStatus, limit: int = 20) -> list[TaskRunRecord]:
+        tasks = [task for task in self.tasks.values() if task.status == status]
+        tasks.sort(key=lambda item: item.updated_at, reverse=True)
+        return tasks[:limit]
+
+    def add_access_event(self, event: AccessEventRecord) -> AccessEventRecord:
+        self.access_events[event.id] = event
+        if event.task_run_id and event.task_run_id in self.tasks:
+            task = self.tasks[event.task_run_id]
+            task.access_event_ids.append(event.id)
+            task.updated_at = utc_now()
+        return event
+
+    def add_artifact(self, artifact: ArtifactRecord) -> ArtifactRecord:
+        self.artifacts[artifact.id] = artifact
+        if artifact.task_run_id and artifact.task_run_id in self.tasks:
+            task = self.tasks[artifact.task_run_id]
+            task.artifact_ids.append(artifact.id)
+            task.updated_at = utc_now()
+            self._sync_artifact_statuses(task)
+        return artifact
+
+    def add_run_memory(self, memory: RunMemoryRecord) -> RunMemoryRecord:
+        self.run_memories[memory.id] = memory
+        return memory
+
+    def save_user_memory(self, *, user_id: str, payload: dict[str, object]) -> dict[str, object]:
+        stored = {
+            "user_id": user_id,
+            "updated_at": utc_now().isoformat(),
+            "payload": payload,
+        }
+        self.user_memories[user_id] = stored
+        return stored
+
+    def get_user_memory(self, user_id: str) -> dict[str, object] | None:
+        return self.user_memories.get(user_id)
+
+    def save_session_memory(self, *, session_id: str, workflow_id: str, payload: dict[str, object]) -> dict[str, object]:
+        stored = {
+            "session_id": session_id,
+            "workflow_id": workflow_id,
+            "updated_at": utc_now().isoformat(),
+            "payload": payload,
+        }
+        self.session_memories[session_id] = stored
+        return stored
+
+    def get_session_memory(self, session_id: str) -> dict[str, object] | None:
+        return self.session_memories.get(session_id)
+
+    def save_workflow_memory(self, *, workflow_id: str, memory_key: str, payload: dict[str, object]) -> dict[str, object]:
+        stored = {
+            "workflow_id": workflow_id,
+            "memory_key": memory_key,
+            "updated_at": utc_now().isoformat(),
+            "payload": payload,
+        }
+        self.workflow_memories[(workflow_id, memory_key)] = stored
+        return stored
+
+    def get_workflow_memory(self, workflow_id: str, memory_key: str) -> dict[str, object] | None:
+        return self.workflow_memories.get((workflow_id, memory_key))
+
+    def save_entity_memory(self, *, entity_type: str, entity_id: str, payload: dict[str, object]) -> dict[str, object]:
+        stored = {
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "updated_at": utc_now().isoformat(),
+            "payload": payload,
+        }
+        self.entity_memories[(entity_type, entity_id)] = stored
+        return stored
+
+    def get_entity_memory(self, entity_type: str, entity_id: str) -> dict[str, object] | None:
+        return self.entity_memories.get((entity_type, entity_id))
+
+    def save_proposed_pattern_memory(self, *, workflow_family: str, pattern_id: str, payload: dict[str, object]) -> dict[str, object]:
+        stored = {
+            "workflow_family": workflow_family,
+            "pattern_id": pattern_id,
+            "updated_at": utc_now().isoformat(),
+            "payload": payload,
+        }
+        self.proposed_pattern_memories[(workflow_family, pattern_id)] = stored
+        return stored
+
+    def get_proposed_pattern_memory(self, workflow_family: str, pattern_id: str) -> dict[str, object] | None:
+        return self.proposed_pattern_memories.get((workflow_family, pattern_id))
+
+    def save_reviewed_pattern_memory(self, *, workflow_family: str, pattern_id: str, payload: dict[str, object]) -> dict[str, object]:
+        stored = {
+            "workflow_family": workflow_family,
+            "pattern_id": pattern_id,
+            "updated_at": utc_now().isoformat(),
+            "payload": payload,
+        }
+        self.reviewed_pattern_memories[(workflow_family, pattern_id)] = stored
+        return stored
+
+    def get_reviewed_pattern_memory(self, workflow_family: str, pattern_id: str) -> dict[str, object] | None:
+        return self.reviewed_pattern_memories.get((workflow_family, pattern_id))
+
+    def list_run_memories(self, scenario_id: str, limit: int = 3) -> list[RunMemoryRecord]:
+        memories = [item for item in self.run_memories.values() if item.scenario_id == scenario_id]
+        memories.sort(key=lambda item: item.created_at, reverse=True)
+        return memories[:limit]
+
+    def save_smart_launch_session(self, session: SmartLaunchSessionRecord) -> SmartLaunchSessionRecord:
+        self.smart_launch_sessions[session.id] = session
+        return session
+
+    def get_smart_launch_session(self, session_id: str) -> SmartLaunchSessionRecord | None:
+        return self.smart_launch_sessions.get(session_id)
+
+    def save_smart_token_state(self, token_state: SmartTokenStateRecord) -> SmartTokenStateRecord:
+        self.smart_token_states[token_state.id] = token_state
+        return token_state
+
+    def list_smart_token_states(self, limit: int = 10) -> list[SmartTokenStateRecord]:
+        token_states = list(self.smart_token_states.values())
+        token_states.sort(key=lambda item: item.created_at, reverse=True)
+        return token_states[:limit]
+
+    def _sync_artifact_statuses(self, task: TaskRunRecord) -> None:
+        target = None
+        if task.status == TaskRunStatus.in_review:
+            target = ArtifactStatus.in_review
+        elif task.status == TaskRunStatus.approved:
+            target = ArtifactStatus.approved
+        elif task.status == TaskRunStatus.filed:
+            target = ArtifactStatus.exported
+        elif task.status == TaskRunStatus.rejected:
+            target = ArtifactStatus.draft
+
+        if target is None:
+            return
+
+        for artifact_id in task.artifact_ids:
+            artifact = self.artifacts.get(artifact_id)
+            if artifact:
+                artifact.status = target
+
+
+class SQLiteStore(MemoryStore):
+    def __init__(self, db_path: str) -> None:
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        super().__init__()
+        self._init_db()
+        self._load_all()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self) -> None:
+        with self._connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS cases (
+                    id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id TEXT PRIMARY KEY,
+                    scenario_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS artifacts (
+                    id TEXT PRIMARY KEY,
+                    task_run_id TEXT,
+                    payload TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS access_events (
+                    id TEXT PRIMARY KEY,
+                    task_run_id TEXT,
+                    created_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS run_memories (
+                    id TEXT PRIMARY KEY,
+                    scenario_id TEXT NOT NULL,
+                    task_run_id TEXT,
+                    outcome TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS user_memories (
+                    id TEXT PRIMARY KEY,
+                    updated_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS session_memories (
+                    id TEXT PRIMARY KEY,
+                    workflow_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS workflow_memories (
+                    workflow_id TEXT NOT NULL,
+                    memory_key TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    PRIMARY KEY (workflow_id, memory_key)
+                );
+                CREATE TABLE IF NOT EXISTS entity_memories (
+                    entity_type TEXT NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    PRIMARY KEY (entity_type, entity_id)
+                );
+                CREATE TABLE IF NOT EXISTS proposed_pattern_memories (
+                    workflow_family TEXT NOT NULL,
+                    pattern_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    PRIMARY KEY (workflow_family, pattern_id)
+                );
+                CREATE TABLE IF NOT EXISTS reviewed_pattern_memories (
+                    workflow_family TEXT NOT NULL,
+                    pattern_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    PRIMARY KEY (workflow_family, pattern_id)
+                );
+                CREATE TABLE IF NOT EXISTS smart_launch_sessions (
+                    id TEXT PRIMARY KEY,
+                    iss TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS smart_token_states (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT,
+                    iss TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                """
+            )
+
+    def _load_all(self) -> None:
+        with self._connect() as conn:
+            self.cases = self._load_table(conn, "cases", CaseRecord)
+            self.tasks = self._load_table(conn, "tasks", TaskRunRecord)
+            self.artifacts = self._load_table(conn, "artifacts", ArtifactRecord)
+            self.access_events = self._load_table(conn, "access_events", AccessEventRecord)
+            self.run_memories = self._load_table(conn, "run_memories", RunMemoryRecord)
+            self.user_memories = self._load_simple_memory_table(conn, "user_memories", "id")
+            self.session_memories = self._load_simple_memory_table(conn, "session_memories", "id")
+            self.workflow_memories = self._load_simple_memory_table(conn, "workflow_memories", ("workflow_id", "memory_key"))
+            self.entity_memories = self._load_simple_memory_table(conn, "entity_memories", ("entity_type", "entity_id"))
+            self.proposed_pattern_memories = self._load_simple_memory_table(conn, "proposed_pattern_memories", ("workflow_family", "pattern_id"))
+            self.reviewed_pattern_memories = self._load_simple_memory_table(conn, "reviewed_pattern_memories", ("workflow_family", "pattern_id"))
+            self.smart_launch_sessions = self._load_table(conn, "smart_launch_sessions", SmartLaunchSessionRecord)
+            self.smart_token_states = self._load_table(conn, "smart_token_states", SmartTokenStateRecord)
+
+    def _load_table(self, conn: sqlite3.Connection, table: str, model_cls):
+        rows = conn.execute(f"SELECT payload FROM {table}").fetchall()
+        return {
+            model_cls.model_validate_json(row["payload"]).id: model_cls.model_validate_json(row["payload"])
+            for row in rows
+        }
+
+    def _load_simple_memory_table(self, conn: sqlite3.Connection, table: str, key_fields: str | tuple[str, str]):
+        rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+        payloads: dict[object, dict[str, object]] = {}
+        for row in rows:
+            payload = json.loads(row["payload"])
+            if isinstance(key_fields, tuple):
+                payloads[tuple(row[field] for field in key_fields)] = payload
+            else:
+                payloads[row[key_fields]] = payload
+        return payloads
+
+    def _upsert(self, table: str, id_value: str, payload: str, **columns: str | None) -> None:
+        with self._connect() as conn:
+            fields = ["id", *columns.keys(), "payload"]
+            placeholders = ", ".join("?" for _ in fields)
+            updates = ", ".join(f"{field}=excluded.{field}" for field in fields[1:])
+            values = [id_value, *columns.values(), payload]
+            conn.execute(
+                f"INSERT INTO {table} ({', '.join(fields)}) VALUES ({placeholders}) "
+                f"ON CONFLICT(id) DO UPDATE SET {updates}",
+                values,
+            )
+
+    def _upsert_compound(self, table: str, payload: dict[str, object], *, key_fields: dict[str, str]) -> None:
+        with self._connect() as conn:
+            fields = [*key_fields.keys(), "updated_at", "payload"]
+            placeholders = ", ".join("?" for _ in fields)
+            values = [*key_fields.values(), str(payload.get("updated_at") or utc_now().isoformat()), json.dumps(payload, default=str)]
+            updates = "updated_at=excluded.updated_at, payload=excluded.payload"
+            conn.execute(
+                f"INSERT INTO {table} ({', '.join(fields)}) VALUES ({placeholders}) "
+                f"ON CONFLICT({', '.join(key_fields.keys())}) DO UPDATE SET {updates}",
+                values,
+            )
+
+    def bootstrap_demo_data(self, scenarios: list[ScenarioSpec]) -> None:
+        if self.cases:
+            return
+        super().bootstrap_demo_data(scenarios)
+        for case in self.cases.values():
+            self._persist_case(case)
+        for task in self.tasks.values():
+            self._persist_task(task)
+        for artifact in self.artifacts.values():
+            self._persist_artifact(artifact)
+        for event in self.access_events.values():
+            self._persist_access_event(event)
+
+    def _persist_case(self, case: CaseRecord) -> None:
+        self._upsert("cases", case.id, case.model_dump_json())
+
+    def _persist_task(self, task: TaskRunRecord) -> None:
+        self._upsert(
+            "tasks",
+            task.id,
+            task.model_dump_json(),
+            scenario_id=task.scenario_id,
+            status=task.status.value if hasattr(task.status, "value") else str(task.status),
+            updated_at=task.updated_at.isoformat(),
+        )
+
+    def _persist_artifact(self, artifact: ArtifactRecord) -> None:
+        self._upsert(
+            "artifacts",
+            artifact.id,
+            artifact.model_dump_json(),
+            task_run_id=artifact.task_run_id,
+        )
+
+    def _persist_access_event(self, event: AccessEventRecord) -> None:
+        self._upsert(
+            "access_events",
+            event.id,
+            event.model_dump_json(),
+            task_run_id=event.task_run_id,
+            created_at=event.created_at.isoformat(),
+        )
+
+    def _persist_run_memory(self, memory: RunMemoryRecord) -> None:
+        self._upsert(
+            "run_memories",
+            memory.id,
+            memory.model_dump_json(),
+            scenario_id=memory.scenario_id,
+            task_run_id=memory.task_run_id,
+            outcome=memory.outcome.value if hasattr(memory.outcome, "value") else str(memory.outcome),
+            created_at=memory.created_at.isoformat(),
+        )
+
+    def _persist_smart_launch_session(self, session: SmartLaunchSessionRecord) -> None:
+        self._upsert(
+            "smart_launch_sessions",
+            session.id,
+            session.model_dump_json(),
+            iss=session.iss,
+            state=session.state,
+            created_at=session.created_at.isoformat(),
+        )
+
+    def _persist_smart_token_state(self, token_state: SmartTokenStateRecord) -> None:
+        self._upsert(
+            "smart_token_states",
+            token_state.id,
+            token_state.model_dump_json(),
+            session_id=token_state.session_id,
+            iss=token_state.iss,
+            created_at=token_state.created_at.isoformat(),
+        )
+
+    def create_case_if_needed(self, request: CreateTaskRunRequest, scenarios: dict[str, ScenarioSpec]) -> str:
+        case_id = super().create_case_if_needed(request, scenarios)
+        self._persist_case(self.cases[case_id])
+        return case_id
+
+    def create_task(self, request: CreateTaskRunRequest, scenarios: dict[str, ScenarioSpec]) -> TaskRunRecord:
+        task = super().create_task(request, scenarios)
+        self._persist_task(task)
+        return task
+
+    def update_task_status(self, task_id: str, status: str, note: str | None = None) -> TaskRunRecord:
+        task = super().update_task_status(task_id, status, note=note)
+        self._persist_task(task)
+        for artifact_id in task.artifact_ids:
+            artifact = self.artifacts.get(artifact_id)
+            if artifact:
+                self._persist_artifact(artifact)
+        return task
+
+    def add_access_event(self, event: AccessEventRecord) -> AccessEventRecord:
+        event = super().add_access_event(event)
+        self._persist_access_event(event)
+        if event.task_run_id and event.task_run_id in self.tasks:
+            self._persist_task(self.tasks[event.task_run_id])
+        return event
+
+    def add_artifact(self, artifact: ArtifactRecord) -> ArtifactRecord:
+        artifact = super().add_artifact(artifact)
+        self._persist_artifact(artifact)
+        if artifact.task_run_id and artifact.task_run_id in self.tasks:
+            self._persist_task(self.tasks[artifact.task_run_id])
+        return artifact
+
+    def add_run_memory(self, memory: RunMemoryRecord) -> RunMemoryRecord:
+        memory = super().add_run_memory(memory)
+        self._persist_run_memory(memory)
+        return memory
+
+    def save_session_memory(self, *, session_id: str, workflow_id: str, payload: dict[str, object]) -> dict[str, object]:
+        stored = super().save_session_memory(session_id=session_id, workflow_id=workflow_id, payload=payload)
+        self._upsert(
+            "session_memories",
+            session_id,
+            json.dumps(stored, default=str),
+            workflow_id=workflow_id,
+            updated_at=str(stored.get("updated_at")),
+        )
+        return stored
+
+    def save_user_memory(self, *, user_id: str, payload: dict[str, object]) -> dict[str, object]:
+        stored = super().save_user_memory(user_id=user_id, payload=payload)
+        self._upsert(
+            "user_memories",
+            user_id,
+            json.dumps(stored, default=str),
+            updated_at=str(stored.get("updated_at")),
+        )
+        return stored
+
+    def save_workflow_memory(self, *, workflow_id: str, memory_key: str, payload: dict[str, object]) -> dict[str, object]:
+        stored = super().save_workflow_memory(workflow_id=workflow_id, memory_key=memory_key, payload=payload)
+        self._upsert_compound("workflow_memories", stored, key_fields={"workflow_id": workflow_id, "memory_key": memory_key})
+        return stored
+
+    def save_entity_memory(self, *, entity_type: str, entity_id: str, payload: dict[str, object]) -> dict[str, object]:
+        stored = super().save_entity_memory(entity_type=entity_type, entity_id=entity_id, payload=payload)
+        self._upsert_compound("entity_memories", stored, key_fields={"entity_type": entity_type, "entity_id": entity_id})
+        return stored
+
+    def save_proposed_pattern_memory(self, *, workflow_family: str, pattern_id: str, payload: dict[str, object]) -> dict[str, object]:
+        stored = super().save_proposed_pattern_memory(workflow_family=workflow_family, pattern_id=pattern_id, payload=payload)
+        self._upsert_compound(
+            "proposed_pattern_memories",
+            stored,
+            key_fields={"workflow_family": workflow_family, "pattern_id": pattern_id},
+        )
+        return stored
+
+    def save_reviewed_pattern_memory(self, *, workflow_family: str, pattern_id: str, payload: dict[str, object]) -> dict[str, object]:
+        stored = super().save_reviewed_pattern_memory(workflow_family=workflow_family, pattern_id=pattern_id, payload=payload)
+        self._upsert_compound(
+            "reviewed_pattern_memories",
+            stored,
+            key_fields={"workflow_family": workflow_family, "pattern_id": pattern_id},
+        )
+        return stored
+
+    def save_smart_launch_session(self, session: SmartLaunchSessionRecord) -> SmartLaunchSessionRecord:
+        session = super().save_smart_launch_session(session)
+        self._persist_smart_launch_session(session)
+        return session
+
+    def save_smart_token_state(self, token_state: SmartTokenStateRecord) -> SmartTokenStateRecord:
+        token_state = super().save_smart_token_state(token_state)
+        self._persist_smart_token_state(token_state)
+        return token_state

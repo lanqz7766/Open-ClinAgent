@@ -1,0 +1,50 @@
+from clinagent.connectors.base import (
+    ConnectorMode,
+    ConnectorBundle,
+    ConnectorError,
+    EHRConnector,
+    ImagingConnector,
+    LaunchContext,
+    InstanceSummary,
+    RetrievedObject,
+    SeriesSummary,
+    SmartEndpoints,
+    SmartCallbackParams,
+    SmartLaunchRequest,
+    SmartLaunchSession,
+    SmartTokenSet,
+    PatientChartBundle,
+    PatientSummary,
+    EncounterSummary,
+    ResourceReference,
+    ImagingStudySummary,
+    StudyMetadata,
+)
+# factory import deferred to avoid circular import with platform.config
+def build_connector_bundle(*args, **kwargs):
+    from clinagent.connectors.factory import build_connector_bundle as _build
+    return _build(*args, **kwargs)
+
+__all__ = [
+    "ConnectorMode",
+    "ConnectorBundle",
+    "ConnectorError",
+    "EHRConnector",
+    "ImagingConnector",
+    "LaunchContext",
+    "InstanceSummary",
+    "RetrievedObject",
+    "SeriesSummary",
+    "SmartEndpoints",
+    "SmartCallbackParams",
+    "SmartLaunchRequest",
+    "SmartLaunchSession",
+    "SmartTokenSet",
+    "PatientChartBundle",
+    "PatientSummary",
+    "EncounterSummary",
+    "ResourceReference",
+    "ImagingStudySummary",
+    "StudyMetadata",
+    "build_connector_bundle",
+]

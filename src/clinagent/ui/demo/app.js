@@ -1,0 +1,1952 @@
+const state = {
+  page: "home",
+  neuroView: "analysis",
+  safetyView: "overview",
+  console: null,
+  findings: {
+    caseId: null,
+    cases: [],
+    queueSummary: null,
+    workspace: null,
+  },
+  queue: {
+    caseId: null,
+    cases: [],
+    queueSummary: null,
+    workspace: null,
+  },
+  diagnosis: {
+    caseId: null,
+    cases: [],
+    queueSummary: null,
+    workspace: null,
+  },
+  screening: {
+    caseId: null,
+    cases: [],
+    queueSummary: null,
+    workspace: null,
+  },
+  neuro: {
+    caseId: null,
+    cases: [],
+    workspace: null,
+    viewer: {
+      instance: null,
+      caseId: null,
+      activeIndex: 0,
+    },
+  },
+  safety: {
+    caseId: null,
+    cases: [],
+    queueSummary: null,
+    workspace: null,
+  },
+  homeMessages: [],
+};
+
+async function fetchJson(url, options) {
+  const response = await fetch(url, options);
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({ error: response.statusText }));
+    throw new Error(payload.error || "Request failed");
+  }
+  return response.json();
+}
+
+async function consumeSSE(url, body, onEvent) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok || !response.body) {
+    const payload = await response.json().catch(() => ({ error: response.statusText }));
+    throw new Error(payload.error || "Streaming request failed");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const chunks = buffer.split("\n\n");
+    buffer = chunks.pop() || "";
+    for (const chunk of chunks) {
+      const lines = chunk.split("\n");
+      const eventLine = lines.find((line) => line.startsWith("event: "));
+      const dataLine = lines.find((line) => line.startsWith("data: "));
+      if (!eventLine || !dataLine) {
+        continue;
+      }
+      const event = eventLine.slice(7).trim();
+      const data = JSON.parse(dataLine.slice(6));
+      onEvent(event, data);
+    }
+  }
+}
+
+function formatDate(value) {
+  if (!value) {
+    return "—";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "—";
+  }
+  return date.toLocaleDateString("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+}
+
+function formatTimestamp(value) {
+  if (!value) {
+    return "—";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "—";
+  }
+  return date.toLocaleString("en-US", {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function titleCase(value) {
+  return (value || "").replace(/_/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function formatSignedNumber(value, digits = 2, unit = "") {
+  const prefix = value > 0 ? "+" : "";
+  return `${prefix}${Number(value).toFixed(digits)}${unit}`;
+}
+
+function formatSignedPercent(value, digits = 1) {
+  const prefix = value > 0 ? "+" : "";
+  return `${prefix}${Number(value).toFixed(digits)}%`;
+}
+
+function formatSpan(startValue, endValue) {
+  const start = new Date(startValue);
+  const end = new Date(endValue);
+  const days = Math.max((end - start) / (1000 * 60 * 60 * 24), 0);
+  const months = days / 30.4375;
+  if (months >= 12) {
+    const years = months / 12;
+    const rounded = Math.abs(years - Math.round(years)) < 0.15 ? Math.round(years) : years.toFixed(1);
+    return `${rounded} year${Number(rounded) === 1 ? "" : "s"}`;
+  }
+  const roundedMonths = Math.max(Math.round(months), 0);
+  return `${roundedMonths} month${roundedMonths === 1 ? "" : "s"}`;
+}
+
+function svgDataUrl(svg) {
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+}
+
+function getNeuroSnapshot(workspace = {}) {
+  const points = workspace.timeline || [];
+  const first = points[0] || {};
+  const latest = points[points.length - 1] || {};
+  const previous = points[points.length - 2] || latest;
+  const span = first.study_date && latest.study_date ? formatSpan(first.study_date, latest.study_date) : "multiple follow-ups";
+  const baseline = Number(first.lesion_volume_ml || 0);
+  const current = Number(latest.lesion_volume_ml || 0);
+  const previousTotal = Number(previous.lesion_volume_ml || current);
+  const delta = current - baseline;
+  const recentDelta = current - previousTotal;
+  const deltaPct = baseline ? (delta / baseline) * 100 : 0;
+  const recentPct = previousTotal ? (recentDelta / previousTotal) * 100 : 0;
+  return {
+    pointCount: points.length,
+    span,
+    baseline,
+    current,
+    delta,
+    deltaPct,
+    recentDelta,
+    recentPct,
+    trendLabel: delta > 0 ? (recentPct > 8 ? "Progressive interval growth" : "Higher than baseline burden") : "Lower than baseline burden",
+  };
+}
+
+function reviewLabel(value) {
+  return titleCase(value);
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function renderInlineMarkdown(value) {
+  return escapeHtml(value)
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/`(.+?)`/g, "<code>$1</code>");
+}
+
+function renderMarkdownLite(value) {
+  const text = String(value || "").replace(/\r\n/g, "\n").trim();
+  if (!text) {
+    return "";
+  }
+
+  const blocks = text.split(/\n{2,}/);
+  const html = [];
+
+  for (const rawBlock of blocks) {
+    const block = rawBlock.trim();
+    if (!block) {
+      continue;
+    }
+
+    if (/^-{3,}$/.test(block)) {
+      html.push("<hr>");
+      continue;
+    }
+
+    const lines = block.split("\n").map((line) => line.trim()).filter(Boolean);
+    if (!lines.length) {
+      continue;
+    }
+
+    const headingMatch = lines[0].match(/^(#{1,4})\s+(.+)$/);
+    if (headingMatch && lines.length === 1) {
+      const level = Math.min(headingMatch[1].length + 1, 4);
+      html.push(`<h${level}>${renderInlineMarkdown(headingMatch[2])}</h${level}>`);
+      continue;
+    }
+
+    if (lines.every((line) => /^[-*]\s+/.test(line))) {
+      html.push(
+        `<ul>${lines
+          .map((line) => `<li>${renderInlineMarkdown(line.replace(/^[-*]\s+/, ""))}</li>`)
+          .join("")}</ul>`,
+      );
+      continue;
+    }
+
+    if (lines.every((line) => /^\d+\.\s+/.test(line))) {
+      html.push(
+        `<ol>${lines
+          .map((line) => `<li>${renderInlineMarkdown(line.replace(/^\d+\.\s+/, ""))}</li>`)
+          .join("")}</ol>`,
+      );
+      continue;
+    }
+
+    if (headingMatch) {
+      const level = Math.min(headingMatch[1].length + 1, 4);
+      html.push(`<h${level}>${renderInlineMarkdown(headingMatch[2])}</h${level}>`);
+      if (lines.length > 1) {
+        html.push(`<p>${lines.slice(1).map(renderInlineMarkdown).join("<br>")}</p>`);
+      }
+      continue;
+    }
+
+    html.push(`<p>${lines.map(renderInlineMarkdown).join("<br>")}</p>`);
+  }
+
+  return html.join("");
+}
+
+function setPage(page) {
+  state.page = page;
+  document.querySelectorAll("[data-page-panel]").forEach((panel) => {
+    panel.classList.toggle("active", panel.dataset.pagePanel === page);
+  });
+  document.querySelectorAll("[data-nav-module]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.navModule === page);
+  });
+  if (page === "home" && state.console) {
+    document.getElementById("page-subtitle").textContent = state.console.tagline;
+  }
+}
+
+function setSubView(group, view) {
+  if (group === "neuro") {
+    state.neuroView = view;
+  } else {
+    state.safetyView = view;
+  }
+  document.querySelectorAll(`[data-${group}-view]`).forEach((button) => {
+    button.classList.toggle("active", button.dataset[`${group}View`] === view);
+  });
+  document.querySelectorAll(`[data-${group}-panel]`).forEach((panel) => {
+    panel.classList.toggle("active", panel.dataset[`${group}Panel`] === view);
+  });
+}
+
+function renderConsole(consolePayload) {
+  document.getElementById("command-prompts").innerHTML = consolePayload.quick_prompts
+    .map((item) => `<button class="prompt-chip home-prompt" data-prompt="${item}">${item}</button>`)
+    .join("");
+  document.getElementById("page-subtitle").textContent = consolePayload.tagline;
+  renderPlatformPages();
+}
+
+function collectPlatformSnapshots() {
+  return [
+    {
+      module: "findings",
+      title: "Findings Closure",
+      status: state.findings.workspace ? "active" : "loading",
+      runs: state.findings.cases.length || 24,
+      success: 96,
+      lastRun: state.findings.workspace?.summary_cards?.find((item) => item.label === "Due")?.value || "2 hours ago",
+      summary:
+        state.findings.workspace?.risk_reason || "Close loop on pending radiology findings and next actions.",
+    },
+    {
+      module: "queue",
+      title: "Queue Triage",
+      status: state.queue.workspace ? "active" : "loading",
+      runs: state.queue.cases.length || 18,
+      success: 94,
+      lastRun: state.queue.workspace?.summary_cards?.find((item) => item.label === "Due")?.value || "5 hours ago",
+      summary:
+        state.queue.workspace?.risk_reason || "Prioritize new inbound cases and recommended queue moves.",
+    },
+    {
+      module: "diagnosis",
+      title: "Missed Diagnosis Review",
+      status: state.diagnosis.workspace ? "paused" : "loading",
+      runs: state.diagnosis.cases.length || 16,
+      success: 92,
+      lastRun: state.diagnosis.workspace?.summary_cards?.find((item) => item.label === "Due")?.value || "1 day ago",
+      summary:
+        state.diagnosis.workspace?.risk_reason || "Review high-risk gaps and suggested follow-up actions.",
+    },
+    {
+      module: "screening",
+      title: "Screening Gap Closure",
+      status: state.screening.workspace ? "active" : "loading",
+      runs: state.screening.cases.length || 31,
+      success: 98,
+      lastRun: state.screening.workspace?.summary_cards?.find((item) => item.label === "Due")?.value || "1 hour ago",
+      summary:
+        state.screening.workspace?.risk_reason || "Identify overdue screenings and support outreach next steps.",
+    },
+  ];
+}
+
+function renderPlatformPages() {
+  const workflowSnapshots = collectPlatformSnapshots();
+  const totalRuns = workflowSnapshots.reduce((sum, item) => sum + Number(item.runs || 0), 0);
+  const activeCount = workflowSnapshots.filter((item) => item.status === "active").length;
+
+  document.getElementById("landing-workflow-cards").innerHTML = [
+    { name: "Data Import", icon: "D" },
+    { name: "Approval Process", icon: "A" },
+    { name: "Notification Chain", icon: "N" },
+  ]
+    .map(
+      (template) => `
+        <article class="template-card">
+          <div class="template-icon">${template.icon}</div>
+          <h3>${template.name}</h3>
+          <p>Start with a pre-built template</p>
+          <button class="ghost-button" type="button">Use Template</button>
+        </article>
+      `,
+    )
+    .join("");
+
+  document.getElementById("workflow-grid").innerHTML = workflowSnapshots
+    .map(
+      (workflow) => `
+        <article class="workflow-list-card">
+          <div class="workflow-list-main">
+            <div class="workflow-list-title">
+              <h3>${workflow.title}</h3>
+              <span class="status-pill ${workflow.status}">
+                ${workflow.status === "active" ? "Active" : workflow.status === "paused" ? "Paused" : "Loading"}
+              </span>
+            </div>
+            <p>${workflow.summary}</p>
+            <div class="workflow-list-stats">
+              <div>
+                <span>Total Runs</span>
+                <strong>${workflow.runs}</strong>
+              </div>
+              <div>
+                <span>Success Rate</span>
+                <strong>${workflow.success}%</strong>
+              </div>
+              <div>
+                <span>Last Run</span>
+                <strong>${workflow.lastRun ? formatTimestamp(workflow.lastRun) : "—"}</strong>
+              </div>
+            </div>
+          </div>
+          <div class="workflow-list-actions">
+            <button class="ghost-button module-open" data-open-module="${workflow.module}" type="button">Open</button>
+            <button class="ghost-button" type="button">Settings</button>
+          </div>
+        </article>
+      `,
+    )
+    .join("");
+
+  document.getElementById("dashboard-stats").innerHTML = [
+    { label: "Total Workflows", value: workflowSnapshots.length, change: "+12%", tone: "blue", icon: "A" },
+    { label: "Active Users", value: "1,429", change: "+8%", tone: "purple", icon: "U" },
+    { label: "Completion Rate", value: "94%", change: "+3%", tone: "green", icon: "T" },
+    { label: "Analytics Events", value: `${totalRuns}`, change: "+18%", tone: "indigo", icon: "B" },
+  ]
+    .map(
+      (stat) => `
+        <article class="stat-card">
+          <div class="stat-card-top">
+            <div class="stat-icon ${stat.tone}">${stat.icon}</div>
+            <span class="stat-change">${stat.change}</span>
+          </div>
+          <strong>${stat.value}</strong>
+          <p>${stat.label}</p>
+        </article>
+      `,
+    )
+    .join("");
+
+  document.getElementById("dashboard-activity").innerHTML = workflowSnapshots
+    .map(
+      (item, index) => `
+        <div class="timeline-row">
+          <span class="timeline-dot tone-${index % 4}"></span>
+          <div>
+            <strong>${item.title}</strong>
+            <p>${item.summary}</p>
+          </div>
+        </div>
+      `,
+    )
+    .join("");
+
+  document.getElementById("dashboard-quickstats").innerHTML = [
+    { label: "Workflow Success Rate", value: 94, tone: "blue" },
+    { label: "User Engagement", value: 87, tone: "purple" },
+    { label: "System Performance", value: 98, tone: "green" },
+    { label: "Data Processing", value: 76, tone: "indigo" },
+  ]
+    .map(
+      (item) => `
+        <div class="progress-row">
+          <div class="progress-label">
+            <span>${item.label}</span>
+            <strong>${item.value}%</strong>
+          </div>
+          <div class="progress-track"><div class="progress-bar ${item.tone}" style="width:${item.value}%"></div></div>
+        </div>
+      `,
+    )
+    .join("");
+
+  document.getElementById("activities-stats").innerHTML = [
+    { label: "Successful", value: "234", tone: "green", icon: "C" },
+    { label: "In Progress", value: `${activeCount + 8}`, tone: "blue", icon: "P" },
+    { label: "Failed", value: "8", tone: "red", icon: "!" },
+    { label: "Total Activities", value: `${totalRuns + 97}`, tone: "purple", icon: "A" },
+  ]
+    .map(
+      (stat) => `
+        <article class="stat-card">
+          <div class="stat-card-top">
+            <div class="stat-icon ${stat.tone}">${stat.icon}</div>
+          </div>
+          <strong>${stat.value}</strong>
+          <p>${stat.label}</p>
+        </article>
+      `,
+    )
+    .join("");
+
+  document.getElementById("activities-list").innerHTML = [
+    {
+      title: "Findings Closure Workspace Updated",
+      user: state.findings.workspace?.patient_label || "Clinical QA",
+      timestamp: "2 minutes ago",
+      type: "workflow",
+      status: "success",
+    },
+    {
+      title: "Neuro longitudinal brief regenerated",
+      user: state.neuro.workspace?.patient?.display_name || "Neuro Agent",
+      timestamp: "15 minutes ago",
+      type: "analysis",
+      status: "in_progress",
+    },
+    {
+      title: "Safety matcher rerun available",
+      user: state.safety.workspace?.owner || "Safety Ops",
+      timestamp: "1 hour ago",
+      type: "function",
+      status: "success",
+    },
+    {
+      title: "Screening outreach queue flagged",
+      user: state.screening.workspace?.patient_label || "Outreach Team",
+      timestamp: "2 hours ago",
+      type: "workflow",
+      status: "error",
+    },
+  ]
+    .map(
+      (activity) => `
+        <div class="activity-row">
+          <div class="activity-main">
+            <span class="activity-status ${activity.status}"></span>
+            <div>
+              <strong>${activity.title}</strong>
+              <p>${activity.user} · ${activity.timestamp}</p>
+            </div>
+          </div>
+          <div class="activity-badges">
+            <span class="badge outline">${activity.type}</span>
+            <span class="badge ${activity.status}">${titleCase(activity.status.replace("_", " "))}</span>
+          </div>
+        </div>
+      `,
+    )
+    .join("");
+
+  document.getElementById("functions-categories").innerHTML = ["All", "Data", "Integration", "Security", "Communication"]
+    .map((category, index) => `<button class="category-pill ${index === 0 ? "active" : ""}" type="button">${category}</button>`)
+    .join("");
+
+  document.getElementById("functions-grid").innerHTML = [
+    { name: "Data Transformation", description: "Transform and process data in real-time", category: "Data", executions: "1,234", icon: "D" },
+    { name: "API Integration", description: "Connect to external APIs seamlessly", category: "Integration", executions: "892", icon: "C" },
+    { name: "Authentication Handler", description: "Manage user authentication and authorization", category: "Security", executions: "2,341", icon: "L" },
+    { name: "Webhook Processor", description: "Process incoming webhook events", category: "Integration", executions: "567", icon: "Z" },
+    { name: "Data Validator", description: "Validate data against defined schemas", category: "Data", executions: "1,876", icon: "V" },
+    { name: "Notification Sender", description: "Send notifications across multiple channels", category: "Communication", executions: "3,421", icon: "N" },
+    { name: "Start from Scratch", description: "Create a custom function from scratch", category: "Template", executions: "", icon: "C", template: true },
+    { name: "Use Template", description: "Start with a pre-built function template", category: "Template", executions: "", icon: "T", template: true },
+  ]
+    .map(
+      (func) => `
+        <article class="function-card${func.template ? " template-surface" : ""}">
+          <div class="function-card-top">
+            <div class="function-icon">${func.icon}</div>
+            <span class="badge outline">${func.category}</span>
+          </div>
+          <h3>${func.name}</h3>
+          <p>${func.description}</p>
+          ${
+            func.template
+              ? ""
+              : `<div class="function-card-footer"><div><span>Executions</span><strong>${func.executions}</strong></div><button class="ghost-button" type="button">Run</button></div>`
+          }
+        </article>
+      `,
+    )
+    .join("");
+
+  document.getElementById("analysis-metrics").innerHTML = [
+    { label: "Total Performance", value: "94.2%", change: "+5.2%", trend: "up" },
+    { label: "Avg Response Time", value: "245ms", change: "-12ms", trend: "up" },
+    { label: "Error Rate", value: "0.8%", change: "+0.2%", trend: "down" },
+    { label: "User Satisfaction", value: "4.8/5", change: "+0.3", trend: "up" },
+  ]
+    .map(
+      (metric) => `
+        <article class="metric-card">
+          <div class="metric-card-top">
+            <p>${metric.label}</p>
+            <span class="metric-trend ${metric.trend}">${metric.trend === "up" ? "↗" : "↘"}</span>
+          </div>
+          <strong>${metric.value}</strong>
+          <span class="metric-change ${metric.trend}">${metric.change} from last period</span>
+        </article>
+      `,
+    )
+    .join("");
+
+  document.getElementById("analysis-breakdown").innerHTML = [
+    { label: "Workflow Efficiency", value: 92, tone: "blue" },
+    { label: "Data Processing", value: 87, tone: "purple" },
+    { label: "API Response", value: 95, tone: "green" },
+    { label: "User Experience", value: 89, tone: "indigo" },
+    { label: "System Reliability", value: 96, tone: "cyan" },
+  ]
+    .map(
+      (item) => `
+        <div class="progress-row">
+          <div class="progress-label">
+            <span>${item.label}</span>
+            <strong>${item.value}%</strong>
+          </div>
+          <div class="progress-track large"><div class="progress-bar ${item.tone}" style="width:${item.value}%"></div></div>
+        </div>
+      `,
+    )
+    .join("");
+
+  document.getElementById("analysis-insights").innerHTML = [
+    {
+      title: "Key Insight",
+      body: "Workflow performance has improved by 12% over the last month, indicating better optimization.",
+      tone: "blue",
+    },
+    {
+      title: "Recommendation",
+      body: "Consider scaling resources during peak review windows to handle increased clinical load.",
+      tone: "purple",
+    },
+    {
+      title: "Achievement",
+      body: "The platform maintained strong review throughput while preserving high completion quality.",
+      tone: "green",
+    },
+  ]
+    .map(
+      (item) => `
+        <article class="insight-card ${item.tone}">
+          <h3>${item.title}</h3>
+          <p>${item.body}</p>
+        </article>
+      `,
+    )
+    .join("");
+}
+
+function renderHomeChat() {
+  const container = document.getElementById("home-chat-log");
+  container.innerHTML = state.homeMessages
+    .map(
+      (message) => `
+        <div class="chat-bubble ${message.role}">
+          <div class="chat-rich">${renderMarkdownLite(message.content)}</div>
+        </div>
+      `,
+    )
+    .join("");
+  container.scrollTop = container.scrollHeight;
+}
+
+function homeSystemMessage(content) {
+  return { role: "system", content };
+}
+
+function summarizeToolCall(name = "", route = {}) {
+  const toolName = name.toLowerCase();
+  const workflowId = route.workflow_id || "";
+  const targetModule = route.target_module || route.suggested_module || "";
+
+  if (toolName.includes("catalog") || toolName.includes("workflow")) {
+    return "Reviewing the available workflows.";
+  }
+  if (toolName.includes("finding")) {
+    return "Reviewing the relevant findings-closure context.";
+  }
+  if (toolName.includes("queue")) {
+    return "Reviewing the relevant queue triage context.";
+  }
+  if (toolName.includes("diagnosis")) {
+    return "Reviewing the relevant missed-diagnosis context.";
+  }
+  if (toolName.includes("screening")) {
+    return "Reviewing the relevant screening-gap context.";
+  }
+  if (toolName.includes("knowledge") || toolName.includes("search")) {
+    return "Checking prior safety patterns and reference signals.";
+  }
+  if (toolName.includes("safety")) {
+    return "Reviewing the relevant safety case context.";
+  }
+  if (toolName.includes("neuro") || toolName.includes("workspace")) {
+    return "Reviewing the longitudinal imaging context.";
+  }
+  if (workflowId === "radiation_safety_monitor" || targetModule === "safety") {
+    return "Reviewing the relevant safety case context.";
+  }
+  if (workflowId === "findings_closure" || targetModule === "findings") {
+    return "Reviewing the relevant findings-closure context.";
+  }
+  if (workflowId === "queue_triage" || targetModule === "queue") {
+    return "Reviewing the relevant queue triage context.";
+  }
+  if (workflowId === "missed_diagnosis_detection" || targetModule === "diagnosis") {
+    return "Reviewing the relevant missed-diagnosis context.";
+  }
+  if (workflowId === "screening_gap_closure" || targetModule === "screening") {
+    return "Reviewing the relevant screening-gap context.";
+  }
+  if (workflowId === "neuro_longitudinal" || targetModule === "neuro") {
+    return "Reviewing the longitudinal imaging context.";
+  }
+  return "Working through the requested clinical context.";
+}
+
+function summarizeAgentEvent(eventName, data, route = {}) {
+  if (eventName === "queued") {
+    return "Preparing the selected workflow.";
+  }
+  if (eventName === "started") {
+    return "Reviewing the relevant context.";
+  }
+  if (eventName === "agent" && data.kind === "tool_call") {
+    return summarizeToolCall(data.data?.name, route);
+  }
+  if (eventName === "agent" && data.kind === "tool_result") {
+    return "Pulling the findings into a concise response.";
+  }
+  return "";
+}
+
+function renderRouterCard(payload = null) {
+  const container = document.getElementById("router-card");
+  if (!payload) {
+    container.innerHTML = `
+      <p class="router-note">Ready to route requests across the available clinical workflows.</p>
+    `;
+    return;
+  }
+  const alternatives = (payload.alternatives || [])
+    .map(
+      (item) =>
+        `<button class="shortcut-button module-open" data-open-module="${item.module}" type="button">${item.title}</button>`,
+    )
+    .join("");
+  const primaryModule = payload.target_module === "home" ? payload.suggested_module : payload.target_module;
+  const header =
+    payload.target_module === "home" ? "Suggested workflow" : "Workflow selected";
+  const title = payload.workflow?.title || "General Clinical Command";
+  const summary =
+    payload.target_module === "home" && payload.suggested_module
+      ? `${payload.reason}`
+      : `${title}. ${payload.reason}`;
+  container.innerHTML = `
+    <div class="router-header">
+      <span class="section-label">${header}</span>
+      ${typeof payload.confidence === "number" && payload.confidence > 0 ? `<span class="meta-muted">${Math.round(payload.confidence * 100)}%</span>` : ""}
+    </div>
+    <strong>${title}</strong>
+    <p class="router-note">${summary}</p>
+    ${
+      primaryModule && primaryModule !== "home"
+        ? `<div class="actions-row compact-actions"><button class="ghost-button module-open" data-open-module="${primaryModule}" type="button">Open ${titleCase(primaryModule)}</button></div>`
+        : ""
+    }
+    ${alternatives ? `<div class="actions-row compact-actions">${alternatives}</div>` : ""}
+  `;
+}
+
+function renderNeuroCaseList() {
+  const selector = document.getElementById("neuro-case-select");
+  selector.innerHTML = state.neuro.cases
+    .map(
+      (item) =>
+        `<option value="${item.id}" ${item.id === state.neuro.caseId ? "selected" : ""}>${item.patient.display_name} · ${item.risk_level}</option>`,
+    )
+    .join("");
+}
+
+function renderFindingsCaseList() {
+  const container = document.getElementById("findings-case-list");
+  container.innerHTML = state.findings.cases
+    .map(
+      (item) => `
+        <div class="case-item${item.id === state.findings.caseId ? " active" : ""}">
+          <button type="button" data-findings-case-id="${item.id}">
+            <div class="meta-row">
+              <strong>${item.title}</strong>
+              <span>${item.risk_label}</span>
+            </div>
+            <p>${item.workflow_title}</p>
+            <div class="meta-row">
+              <span>${item.queue}</span>
+              <span>${formatDate(item.due_at)}</span>
+            </div>
+          </button>
+        </div>
+      `,
+    )
+    .join("");
+}
+
+function renderFindingsWorkspace(workspace) {
+  state.findings.workspace = workspace;
+  renderFindingsCaseList();
+  document.getElementById("findings-title").textContent = workspace.title;
+  document.getElementById("findings-summary").textContent = workspace.risk_reason;
+  document.getElementById("findings-meta").innerHTML = `
+    <span>${workspace.patient_label}</span>
+    <span>${workspace.service_line}</span>
+    <span>${workspace.queue}</span>
+  `;
+  document.getElementById("findings-risk-badge").textContent = workspace.risk_label;
+  document.getElementById("findings-risk-badge").className = `risk-badge ${workspace.risk_tier}`;
+  document.getElementById("findings-summary-cards").innerHTML = workspace.summary_cards
+    .map(
+      (item) => `
+        <article class="summary-card">
+          <span>${item.label}</span>
+          <strong>${item.label === "Due" ? formatTimestamp(item.value) : item.value}</strong>
+        </article>
+      `,
+    )
+    .join("");
+  document.getElementById("findings-focus").textContent = `${workspace.focus_metric.label}: ${workspace.focus_metric.value} ${workspace.focus_metric.unit} · ${workspace.focus_metric.delta}`;
+  document.getElementById("findings-actions").innerHTML = workspace.recommended_actions
+    .map(
+      (item) => `
+        <article class="report-block">
+          <h4>${item}</h4>
+          <p>${workspace.workflow_title}</p>
+        </article>
+      `,
+    )
+    .join("");
+  document.getElementById("findings-rationale").textContent = workspace.rationale[0];
+  document.getElementById("findings-evidence").innerHTML = workspace.evidence_grid
+    .map(
+      (item) => `
+        <div class="field-chip">
+          <span>${item.label}</span>
+          <strong>${item.value}</strong>
+        </div>
+      `,
+    )
+    .join("");
+  renderPlatformPages();
+}
+
+function renderQueueCaseList() {
+  const container = document.getElementById("queue-case-list");
+  container.innerHTML = state.queue.cases
+    .map(
+      (item) => `
+        <div class="case-item${item.id === state.queue.caseId ? " active" : ""}">
+          <button type="button" data-queue-case-id="${item.id}">
+            <div class="meta-row">
+              <strong>${item.title}</strong>
+              <span>${item.risk_label}</span>
+            </div>
+            <p>${item.workflow_title}</p>
+            <div class="meta-row">
+              <span>${item.queue}</span>
+              <span>${formatDate(item.due_at)}</span>
+            </div>
+          </button>
+        </div>
+      `,
+    )
+    .join("");
+}
+
+function renderQueueWorkspace(workspace) {
+  state.queue.workspace = workspace;
+  renderQueueCaseList();
+  document.getElementById("queue-title").textContent = workspace.title;
+  document.getElementById("queue-subtitle").textContent = workspace.risk_reason;
+  document.getElementById("queue-meta").innerHTML = `
+    <span>${workspace.patient_label}</span>
+    <span>${workspace.service_line}</span>
+    <span>${workspace.queue}</span>
+  `;
+  document.getElementById("queue-risk-badge").textContent = workspace.risk_label;
+  document.getElementById("queue-risk-badge").className = `risk-badge ${workspace.risk_tier}`;
+  document.getElementById("queue-summary-cards").innerHTML = workspace.summary_cards
+    .map(
+      (item) => `
+        <article class="summary-card">
+          <span>${item.label}</span>
+          <strong>${item.label === "Due" ? formatTimestamp(item.value) : item.value}</strong>
+        </article>
+      `,
+    )
+    .join("");
+  document.getElementById("queue-focus").textContent =
+    `${workspace.focus_metric.label}: ${workspace.focus_metric.value} ${workspace.focus_metric.unit} · ${workspace.focus_metric.delta}`;
+  document.getElementById("queue-actions").innerHTML = workspace.recommended_actions
+    .map(
+      (item) => `
+        <article class="report-block">
+          <h4>${item}</h4>
+          <p>${workspace.workflow_title}</p>
+        </article>
+      `,
+    )
+    .join("");
+  document.getElementById("queue-rationale").textContent = workspace.queue_recommendation || workspace.rationale[0];
+  document.getElementById("queue-evidence").innerHTML = workspace.evidence_grid
+    .map(
+      (item) => `
+        <div class="field-chip">
+          <span>${item.label}</span>
+          <strong>${item.value}</strong>
+        </div>
+      `,
+    )
+    .join("");
+  renderPlatformPages();
+}
+
+function renderDiagnosisCaseList() {
+  const container = document.getElementById("diagnosis-case-list");
+  container.innerHTML = state.diagnosis.cases
+    .map(
+      (item) => `
+        <div class="case-item${item.id === state.diagnosis.caseId ? " active" : ""}">
+          <button type="button" data-diagnosis-case-id="${item.id}">
+            <div class="meta-row">
+              <strong>${item.title}</strong>
+              <span>${item.risk_label}</span>
+            </div>
+            <p>${item.workflow_title}</p>
+            <div class="meta-row">
+              <span>${item.queue}</span>
+              <span>${formatDate(item.due_at)}</span>
+            </div>
+          </button>
+        </div>
+      `,
+    )
+    .join("");
+}
+
+function renderDiagnosisWorkspace(workspace) {
+  state.diagnosis.workspace = workspace;
+  renderDiagnosisCaseList();
+  document.getElementById("diagnosis-title").textContent = workspace.title;
+  document.getElementById("diagnosis-subtitle").textContent = workspace.risk_reason;
+  document.getElementById("diagnosis-meta").innerHTML = `
+    <span>${workspace.patient_label}</span>
+    <span>${workspace.service_line}</span>
+    <span>${workspace.queue}</span>
+  `;
+  document.getElementById("diagnosis-risk-badge").textContent = workspace.risk_label;
+  document.getElementById("diagnosis-risk-badge").className = `risk-badge ${workspace.risk_tier}`;
+  document.getElementById("diagnosis-summary-cards").innerHTML = workspace.summary_cards
+    .map(
+      (item) => `
+        <article class="summary-card">
+          <span>${item.label}</span>
+          <strong>${item.label === "Due" ? formatTimestamp(item.value) : item.value}</strong>
+        </article>
+      `,
+    )
+    .join("");
+  document.getElementById("diagnosis-focus").textContent =
+    `${workspace.focus_metric.label}: ${workspace.focus_metric.value} ${workspace.focus_metric.unit} · ${workspace.focus_metric.delta}`;
+  document.getElementById("diagnosis-actions").innerHTML = workspace.recommended_actions
+    .map(
+      (item) => `
+        <article class="report-block">
+          <h4>${item}</h4>
+          <p>${workspace.workflow_title}</p>
+        </article>
+      `,
+    )
+    .join("");
+  document.getElementById("diagnosis-rationale").textContent = workspace.gap_recommendation || workspace.rationale[0];
+  document.getElementById("diagnosis-evidence").innerHTML = workspace.evidence_grid
+    .map(
+      (item) => `
+        <div class="field-chip">
+          <span>${item.label}</span>
+          <strong>${item.value}</strong>
+        </div>
+      `,
+    )
+    .join("");
+  renderPlatformPages();
+}
+
+function renderScreeningCaseList() {
+  const container = document.getElementById("screening-case-list");
+  container.innerHTML = state.screening.cases
+    .map(
+      (item) => `
+        <div class="case-item${item.id === state.screening.caseId ? " active" : ""}">
+          <button type="button" data-screening-case-id="${item.id}">
+            <div class="meta-row">
+              <strong>${item.title}</strong>
+              <span>${item.risk_label}</span>
+            </div>
+            <p>${item.workflow_title}</p>
+            <div class="meta-row">
+              <span>${item.queue}</span>
+              <span>${formatDate(item.due_at)}</span>
+            </div>
+          </button>
+        </div>
+      `,
+    )
+    .join("");
+}
+
+function renderScreeningWorkspace(workspace) {
+  state.screening.workspace = workspace;
+  renderScreeningCaseList();
+  document.getElementById("screening-title").textContent = workspace.title;
+  document.getElementById("screening-subtitle").textContent = workspace.risk_reason;
+  document.getElementById("screening-meta").innerHTML = `
+    <span>${workspace.patient_label}</span>
+    <span>${workspace.service_line}</span>
+    <span>${workspace.queue}</span>
+  `;
+  document.getElementById("screening-risk-badge").textContent = workspace.risk_label;
+  document.getElementById("screening-risk-badge").className = `risk-badge ${workspace.risk_tier}`;
+  document.getElementById("screening-summary-cards").innerHTML = workspace.summary_cards
+    .map(
+      (item) => `
+        <article class="summary-card">
+          <span>${item.label}</span>
+          <strong>${item.label === "Due" ? formatTimestamp(item.value) : item.value}</strong>
+        </article>
+      `,
+    )
+    .join("");
+  document.getElementById("screening-focus").textContent =
+    `${workspace.focus_metric.label}: ${workspace.focus_metric.value} ${workspace.focus_metric.unit} · ${workspace.focus_metric.delta}`;
+  document.getElementById("screening-actions").innerHTML = workspace.recommended_actions
+    .map(
+      (item) => `
+        <article class="report-block">
+          <h4>${item}</h4>
+          <p>${workspace.workflow_title}</p>
+        </article>
+      `,
+    )
+    .join("");
+  document.getElementById("screening-rationale").textContent = workspace.gap_recommendation || workspace.rationale[0];
+  document.getElementById("screening-evidence").innerHTML = workspace.evidence_grid
+    .map(
+      (item) => `
+        <div class="field-chip">
+          <span>${item.label}</span>
+          <strong>${item.value}</strong>
+        </div>
+      `,
+    )
+    .join("");
+  renderPlatformPages();
+}
+
+function renderUploads(uploads) {
+  const container = document.getElementById("upload-list");
+  const items = Array.isArray(uploads) ? uploads : [];
+  container.innerHTML = items.length
+    ? items
+        .map(
+          (item) => `
+            <div class="upload-chip">
+              <span>${item.filename}</span>
+              <span>${formatTimestamp(item.added_at)}</span>
+            </div>
+          `,
+        )
+        .join("")
+    : '<p class="support-copy">No local notes attached.</p>';
+}
+
+function renderNeuroHero(workspace) {
+  const patient = workspace.patient;
+  const snapshot = getNeuroSnapshot(workspace);
+  document.getElementById("patient-name").textContent = patient.display_name || workspace.title;
+  document.getElementById("patient-summary").textContent =
+    patient.summary || `${snapshot.pointCount} follow-up timepoints over ${snapshot.span}. Latest imaging shows ${snapshot.trendLabel.toLowerCase()}.`;
+  document.getElementById("patient-meta").innerHTML = `
+    <span>Case ${patient.id}</span>
+    <span>${patient.sex}</span>
+    <span>Age ${patient.age}</span>
+    <span>${patient.histology || "Brain metastasis"}</span>
+    <span>${snapshot.pointCount} scans</span>
+  `;
+  document.getElementById("review-badge").textContent = reviewLabel(workspace.review.status);
+  document.getElementById("risk-pill").textContent = workspace.analysis.risk_level;
+  document.getElementById("neuro-signal-number").textContent = `${titleCase(snapshot.trendLabel)} post-RT signal`;
+  document.getElementById("neuro-signal-note").textContent = `${snapshot.pointCount} scans across ${snapshot.span}.`;
+}
+
+function renderMetrics(workspace) {
+  const analysis = workspace.analysis;
+  const snapshot = getNeuroSnapshot(workspace);
+  const baselineMl = Number(analysis.baseline_total_ml ?? analysis.baseline_volume_ml ?? snapshot.baseline ?? 0);
+  const latestMl = Number(analysis.latest_total_ml ?? analysis.latest_volume_ml ?? snapshot.current ?? 0);
+  const metrics = [
+    { label: "Scans", value: `${snapshot.pointCount}` },
+    { label: "Span", value: snapshot.span },
+    { label: "Baseline", value: `${baselineMl.toFixed(2)} mL` },
+    { label: "Latest", value: `${latestMl.toFixed(2)} mL` },
+  ];
+  document.getElementById("metric-grid").innerHTML = metrics
+    .map(
+      (metric) => `
+        <div class="metric">
+          <span class="metric-label">${metric.label}</span>
+          <span class="metric-value">${metric.value}</span>
+        </div>
+      `,
+    )
+    .join("");
+}
+
+function renderNeuroChat(messages) {
+  const log = document.getElementById("chat-log");
+  const entries = Array.isArray(messages) ? messages : [];
+  log.innerHTML = entries
+    .slice(-6)
+    .map(
+      (message) => `
+        <div class="chat-bubble ${message.role}">
+          <div class="chat-rich">${renderMarkdownLite(message.content)}</div>
+        </div>
+      `,
+    )
+    .join("");
+  log.scrollTop = log.scrollHeight;
+}
+
+function renderWorkflow(workflow) {
+  document.getElementById("workflow-title").textContent = workflow.title;
+  document.getElementById("workflow-objective").textContent = workflow.objective;
+  document.getElementById("workflow-status").textContent = reviewLabel(workflow.status);
+  document.getElementById("workflow-steps").innerHTML = workflow.steps
+    .map(
+      (step) => `
+        <article class="workflow-step">
+          <header>
+            <div>
+              <strong>${step.name}</strong>
+            </div>
+            <span class="step-badge">${step.status}</span>
+          </header>
+          <p>${step.detail}</p>
+        </article>
+      `,
+    )
+    .join("");
+}
+
+function renderTimeline(points) {
+  const container = document.getElementById("timeline");
+  container.innerHTML = points
+    .map(
+      (point, index) => `
+        <div class="timeline-node${index === points.length - 1 ? " latest" : ""}">
+          <span class="timeline-dot"></span>
+          <strong>${titleCase(point.timepoint)}</strong>
+          <small>${formatDate(point.study_date)}</small>
+        </div>
+      `,
+    )
+    .join("");
+  container.dataset.count = `${points.length}`;
+}
+
+function buildChartPath(points, key, width, height, padding, min, max) {
+  return points
+    .map((point, index) => {
+      const x = padding + (index / Math.max(points.length - 1, 1)) * (width - padding * 2);
+      const ratio = (point[key] - min) / Math.max(max - min, 0.001);
+      const y = height - padding - ratio * (height - padding * 2);
+      return `${index === 0 ? "M" : "L"} ${x.toFixed(1)} ${y.toFixed(1)}`;
+    })
+    .join(" ");
+}
+
+function renderChart(points) {
+  const svg = document.getElementById("trend-chart");
+  const width = 560;
+  const height = 240;
+  const padding = 30;
+  const series = points.map((point) => ({
+    ...point,
+    lesion_volume_ml: Number(point.lesion_volume_ml || 0),
+  }));
+  const allValues = [...series.map((point) => point.lesion_volume_ml)];
+  const min = Math.min(...allValues) * 0.88;
+  const max = Math.max(...allValues) * 1.12;
+  const totalPath = buildChartPath(series, "lesion_volume_ml", width, height, padding, min, max);
+  const coordinates = series.map((point, index) => {
+    const x = padding + (index / Math.max(series.length - 1, 1)) * (width - padding * 2);
+    const ratio = (point.lesion_volume_ml - min) / Math.max(max - min, 0.001);
+    const y = height - padding - ratio * (height - padding * 2);
+    return { x, y, point };
+  });
+  const areaPath = `${totalPath} L ${width - padding} ${height - padding} L ${padding} ${height - padding} Z`;
+  const baselineY =
+    height -
+    padding -
+    (((series[0]?.lesion_volume_ml || 0) - min) / Math.max(max - min, 0.001)) * (height - padding * 2);
+  const markerLabels = coordinates
+    .map((coordinate, index) => {
+      const isLatest = index === coordinates.length - 1;
+      const isFirst = index === 0;
+      const label = isFirst ? "Baseline" : isLatest ? "Latest" : titleCase(coordinate.point.timepoint);
+      return `
+        <g>
+          <circle cx="${coordinate.x.toFixed(1)}" cy="${coordinate.y.toFixed(1)}" r="${isLatest ? 7 : 5}" fill="${isLatest ? "#c14553" : "#0d6ab8"}" stroke="white" stroke-width="2"></circle>
+          <text x="${coordinate.x.toFixed(1)}" y="${coordinate.y - 14}" fill="#66798c" font-size="11" text-anchor="middle">${label}</text>
+        </g>
+      `;
+    })
+    .join("");
+
+  svg.innerHTML = `
+    <defs>
+      <linearGradient id="neuro-fill" x1="0" x2="0" y1="0" y2="1">
+        <stop offset="0%" stop-color="#0d6ab8" stop-opacity="0.28"></stop>
+        <stop offset="100%" stop-color="#0d6ab8" stop-opacity="0.02"></stop>
+      </linearGradient>
+    </defs>
+    <rect x="0" y="0" width="${width}" height="${height}" rx="22" fill="#FFFFFF" fill-opacity="0.92"></rect>
+    <path d="${areaPath}" fill="url(#neuro-fill)" stroke="none"></path>
+    <line x1="${padding}" y1="${baselineY.toFixed(1)}" x2="${width - padding}" y2="${baselineY.toFixed(1)}" stroke="rgba(197, 75, 91, 0.18)" stroke-dasharray="5 6"></line>
+    <line x1="${padding}" y1="${height - padding}" x2="${width - padding}" y2="${height - padding}" stroke="rgba(15,39,59,0.1)"></line>
+    <line x1="${padding}" y1="${padding}" x2="${padding}" y2="${height - padding}" stroke="rgba(15,39,59,0.08)"></line>
+    <path d="${totalPath}" fill="none" stroke="#0d6ab8" stroke-width="4" stroke-linecap="round"></path>
+    ${markerLabels}
+    <text x="${padding}" y="${padding - 6}" fill="#66798c" font-size="12">Lower burden</text>
+    <text x="${width - padding}" y="${padding - 6}" fill="#66798c" font-size="12" text-anchor="end">Higher burden</text>
+  `;
+}
+
+function renderNeuroAnalysis(workspace) {
+  const analysis = workspace.analysis;
+  const snapshot = getNeuroSnapshot(workspace);
+  const baselineMl = Number(analysis.baseline_total_ml ?? analysis.baseline_volume_ml ?? snapshot.baseline ?? 0);
+  const latestMl = Number(analysis.latest_total_ml ?? analysis.latest_volume_ml ?? snapshot.current ?? 0);
+  const recentPct = Number(analysis.recent_segment_pct ?? analysis.recent_interval_change_pct ?? snapshot.recentPct ?? 0);
+  document.getElementById("attention-banner").innerHTML = `
+    <strong>${analysis.risk_level} post-treatment signal</strong>
+    <div>${analysis.risk_reason}</div>
+  `;
+  document.getElementById("neuro-baseline-value").textContent = `${baselineMl.toFixed(2)} mL`;
+  document.getElementById("neuro-latest-value").textContent = `${latestMl.toFixed(2)} mL`;
+  document.getElementById("neuro-recent-note").textContent =
+    `Recent interval ${formatSignedPercent(recentPct)} · overall ${formatSignedPercent(snapshot.deltaPct)} from baseline.`;
+}
+
+function renderReport(workspace) {
+  const report = workspace.report || {};
+  const preview = workspace.imaging_preview || {};
+  const visualizations = workspace.visualizations || {};
+  const previewUrl =
+    preview.image_url ||
+    (visualizations.comparison_svg ? svgDataUrl(visualizations.comparison_svg) : null) ||
+    "/demo-assets/brain-metastasis-preview.svg";
+  document.getElementById("preview-image").src = previewUrl;
+  document.getElementById("preview-caption").textContent = preview.caption || "";
+  document.getElementById("report-title").textContent = report.title || "Longitudinal review brief";
+  document.getElementById("report-summary").textContent = report.summary || "";
+  const rendered = report.rendered_html || "";
+  const renderedContainer = document.getElementById("report-rendered");
+  renderedContainer.innerHTML = rendered;
+  renderedContainer.classList.toggle("has-content", Boolean(rendered));
+  document.getElementById("report-sections").innerHTML = rendered
+    ? ""
+    : (report.sections || [])
+        .slice(0, 3)
+        .map(
+          (section) => `
+            <article class="report-block">
+              <h4>${section.title}</h4>
+              <p>${section.body}</p>
+            </article>
+          `,
+        )
+        .join("");
+  document.getElementById("report-footnote").textContent = `Next review focus: ${
+    (report.physician_questions || [])[0] || "Correlate the latest MRI with symptoms and treatment timing."
+  }`;
+}
+
+function getNeuroViewerPayload(workspace) {
+  return workspace?.imaging_preview?.viewer || workspace?.viewer || {};
+}
+
+function getNiivueConstructor() {
+  return window.niivue?.Niivue || window.Niivue || null;
+}
+
+async function renderNeuroViewer(workspace) {
+  const preview = workspace.imaging_preview || {};
+  const viewer = getNeuroViewerPayload(workspace);
+  const timepoints = viewer.timepoints || [];
+  const canvas = document.getElementById("neuro-viewer-canvas");
+  const status = document.getElementById("neuro-viewer-status");
+  const select = document.getElementById("neuro-viewer-timepoint-select");
+  const fallback = document.getElementById("preview-image");
+  const caption = document.getElementById("preview-caption");
+
+  if (!canvas || !status || !select || !fallback || !caption) {
+    return;
+  }
+
+  if (!timepoints.length) {
+    status.textContent = "Static preview";
+    canvas.classList.remove("active");
+    fallback.classList.remove("hidden");
+    fallback.src = fallback.src || "/demo-assets/brain-metastasis-preview.svg";
+    caption.textContent = preview.caption || "Viewer assets are not available for this case.";
+    return;
+  }
+
+  const previousCaseId = state.neuro.viewer.caseId;
+  state.neuro.viewer.caseId = workspace.id;
+  if (!state.neuro.viewer.instance || previousCaseId !== workspace.id) {
+    state.neuro.viewer.instance = null;
+    state.neuro.viewer.activeIndex = timepoints.length - 1;
+  }
+
+  select.innerHTML = timepoints
+    .map(
+      (item, index) =>
+        `<option value="${index}" ${index === state.neuro.viewer.activeIndex ? "selected" : ""}>${item.clinical_label || item.timepoint} · ${formatDate(item.study_date)}</option>`,
+    )
+    .join("");
+
+  const niivueCtor = getNiivueConstructor();
+  if (!niivueCtor) {
+    status.textContent = "Static preview";
+    canvas.classList.remove("active");
+    fallback.classList.remove("hidden");
+    caption.textContent = `${preview.caption || "Interactive viewer unavailable."} Showing a static preview instead.`;
+    return;
+  }
+
+  const activeIndex = Math.min(Math.max(state.neuro.viewer.activeIndex || 0, 0), timepoints.length - 1);
+  const active = timepoints[activeIndex] || timepoints[timepoints.length - 1];
+  state.neuro.viewer.activeIndex = activeIndex;
+
+  try {
+    const instance = new niivueCtor({
+      show3Dcrosshair: false,
+      isOrientCube: false,
+      backColor: [0.965, 0.973, 0.98, 1],
+      textColor: [0.2, 0.24, 0.3, 1],
+      crosshairColor: [0.15, 0.42, 0.75, 1],
+      showLegend: false,
+    });
+    state.neuro.viewer.instance = instance;
+    const attach = instance.attachToCanvas || instance.attachTo;
+    if (typeof attach !== "function") {
+      throw new Error("NiiVue attach method unavailable");
+    }
+    attach.call(instance, canvas);
+    if (typeof instance.setRadiologicalConvention === "function") {
+      instance.setRadiologicalConvention(true);
+    }
+    await instance.loadVolumes([
+      { url: active.image_url },
+      { url: active.mask_url, opacity: 0.4, colormap: "red", cal_min: 0.5, cal_max: 1.5 },
+    ]);
+    canvas.classList.add("active");
+    fallback.classList.add("hidden");
+    status.textContent = `${active.clinical_label || active.timepoint} · ${formatDate(active.study_date)}`;
+    caption.textContent = `${preview.caption || "Interactive overlay viewer."} Current selection: ${active.clinical_label || active.timepoint}.`;
+  } catch (error) {
+    state.neuro.viewer.instance = null;
+    canvas.classList.remove("active");
+    fallback.classList.remove("hidden");
+    status.textContent = "Static preview";
+    caption.textContent = `${preview.caption || "Interactive viewer unavailable."} Showing a static preview instead.`;
+  }
+}
+
+function renderNeuroReview(review, audit) {
+  const currentReview = review || {};
+  const auditTrail = Array.isArray(audit) ? audit : [];
+  document.getElementById("review-comment").value = currentReview.comment || "";
+  document.getElementById("review-history").innerHTML = `
+    <div class="audit-item info">
+      <strong>${reviewLabel(currentReview.status)}</strong>
+      <p>${currentReview.comment || "No reviewer comment yet."}</p>
+      <div class="meta-row">
+        <span>${currentReview.reviewer}</span>
+        <span>${formatTimestamp(currentReview.updated_at)}</span>
+      </div>
+    </div>
+  `;
+  document.getElementById("audit-list").innerHTML = auditTrail
+    .slice(0, 6)
+    .map(
+      (item) => `
+        <article class="audit-item ${item.severity}">
+          <strong>${item.title}</strong>
+          <p>${item.detail}</p>
+          <div class="meta-row">
+            <span>${item.severity}</span>
+            <span>${formatTimestamp(item.created_at)}</span>
+          </div>
+        </article>
+      `,
+    )
+    .join("");
+}
+
+function renderNeuroWorkspace(workspace) {
+  state.neuro.workspace = workspace;
+  renderNeuroCaseList();
+  renderNeuroHero(workspace);
+  renderMetrics(workspace);
+  renderNeuroChat(workspace.messages);
+  renderWorkflow(workspace.workflow);
+  renderTimeline(workspace.timeline);
+  renderChart(workspace.timeline);
+  renderNeuroAnalysis(workspace);
+  renderReport(workspace);
+  renderNeuroReview(workspace.review, workspace.audit);
+  renderUploads(workspace.uploads);
+  renderNeuroViewer(workspace);
+  renderPlatformPages();
+}
+
+function renderSafetyCaseList() {
+  document.getElementById("queue-summary").innerHTML = `
+    <div class="queue-pill watch"><span>Watch</span><strong>${state.safety.queueSummary.watch}</strong></div>
+    <div class="queue-pill alert"><span>Alert</span><strong>${state.safety.queueSummary.alert}</strong></div>
+    <div class="queue-pill urgent"><span>Urgent</span><strong>${state.safety.queueSummary.urgent}</strong></div>
+  `;
+  document.getElementById("safety-case-list").innerHTML = state.safety.cases
+    .map(
+      (item) => `
+        <div class="case-item${item.id === state.safety.caseId ? " active" : ""}">
+          <button type="button" data-safety-case-id="${item.id}">
+            <div class="meta-row">
+              <strong>${item.title}</strong>
+              <span class="tag-pill">${item.risk_label}</span>
+            </div>
+            <p>${item.owner}</p>
+            <div class="meta-row">
+              <span>${item.queue}</span>
+              <span>${formatDate(item.received_at)}</span>
+            </div>
+          </button>
+        </div>
+      `,
+    )
+    .join("");
+}
+
+function renderSafetyHero(workspace) {
+  document.getElementById("safety-case-title").textContent = workspace.title;
+  document.getElementById("safety-case-subtitle").textContent = workspace.risk_reason;
+  document.getElementById("safety-case-meta").innerHTML = `
+    <span>${workspace.patient_label}</span>
+    <span>${workspace.service_line}</span>
+    <span>${workspace.machine}</span>
+    <span>${workspace.queue}</span>
+  `;
+  document.getElementById("safety-risk-badge").textContent = workspace.risk_label;
+  document.getElementById("safety-risk-badge").className = `risk-badge ${workspace.risk_tier}`;
+  document.getElementById("safety-review-badge").textContent = titleCase(workspace.review.status);
+}
+
+function renderSafetySummaryCards(workspace) {
+  document.getElementById("safety-summary-cards").innerHTML = workspace.summary_cards
+    .map(
+      (item) => `
+        <article class="summary-card">
+          <span>${item.label}</span>
+          <strong>${item.label === "Due" ? formatTimestamp(item.value) : item.value}</strong>
+        </article>
+      `,
+    )
+    .join("");
+}
+
+function renderSafetyOverview(workspace) {
+  const fields = {
+    ...workspace.fields,
+    machine: workspace.machine,
+    owner: workspace.owner,
+    due: formatTimestamp(workspace.due_at),
+  };
+  document.getElementById("intake-fields").innerHTML = Object.entries(fields)
+    .map(
+      ([label, value]) => `
+        <div class="field-chip">
+          <span>${titleCase(label)}</span>
+          <strong>${value}</strong>
+        </div>
+      `,
+    )
+    .join("");
+  document.getElementById("case-text").textContent = workspace.free_text;
+  document.getElementById("timeline-list").innerHTML = workspace.timeline
+    .map(
+      (item) => `
+        <article class="timeline-item">
+          <strong>${item.title}</strong>
+          <p>${item.detail}</p>
+          <span class="meta-muted">${formatTimestamp(item.created_at)}</span>
+        </article>
+      `,
+    )
+    .join("");
+
+  const top = workspace.matched_incidents[0];
+  document.getElementById("top-match-title").textContent = top ? top.title : "No strong pattern found";
+  document.getElementById("risk-summary").innerHTML = `
+    <strong>${workspace.risk_label}</strong>
+    <p>${workspace.risk_reason}</p>
+  `;
+  document.getElementById("top-match-details").innerHTML = top
+    ? `
+        <p class="section-label">Match rationale</p>
+        <p>${top.summary}</p>
+        <div class="meta-row">
+          <span class="tag-pill">${top.category}</span>
+          <span class="tag-pill">${top.process_step}</span>
+          <span class="tag-pill">${top.evidence_level}</span>
+        </div>
+        <p>${top.matched_signals.join(", ")}</p>
+        <p><a href="${top.source.url}" target="_blank" rel="noreferrer">${top.source.label}</a></p>
+      `
+    : "<p>No strong historical failure overlap was found.</p>";
+}
+
+function renderSafetyEvidence(workspace) {
+  document.getElementById("match-list").innerHTML = workspace.matched_incidents
+    .map(
+      (item) => `
+        <article class="match-card">
+          <div class="meta-row">
+            <h4>${item.title}</h4>
+            <span class="match-score">Score ${item.score}</span>
+          </div>
+          <p>${item.summary}</p>
+          <div class="meta-row">
+            <span class="tag-pill">${item.category}</span>
+            <span class="tag-pill">${item.process_step}</span>
+          </div>
+        </article>
+      `,
+    )
+    .join("");
+  document.getElementById("recommended-checks").innerHTML = workspace.playbook
+    .map((item) => `<div class="check-item">${item}</div>`)
+    .join("");
+  document.getElementById("review-questions").innerHTML = workspace.review_questions
+    .map((item) => `<div class="question-item">${item}</div>`)
+    .join("");
+  document.getElementById("email-card").innerHTML = `
+    <p class="section-label">Escalation email</p>
+    <p><strong>${workspace.mock_email.subject}</strong></p>
+    <p>${workspace.mock_email.body}</p>
+    <p class="meta-muted">${workspace.mock_email.sent ? "Prepared and marked sent" : "Prepared only"}</p>
+  `;
+}
+
+function renderSafetyReview(workspace) {
+  document.getElementById("safety-review-comment").value = workspace.review.comment || "";
+  document.getElementById("review-history-safety").innerHTML = `
+    <article class="audit-item info">
+      <strong>${titleCase(workspace.review.status)}</strong>
+      <p>${workspace.review.comment}</p>
+      <div class="meta-row">
+        <span>Last updated</span>
+        <span>${formatTimestamp(workspace.review.updated_at)}</span>
+      </div>
+    </article>
+  `;
+  document.getElementById("audit-list-safety").innerHTML = workspace.audit
+    .slice(0, 6)
+    .map(
+      (item) => `
+        <article class="audit-item ${item.severity}">
+          <strong>${item.title}</strong>
+          <p>${item.detail}</p>
+          <div class="meta-row">
+            <span>${item.severity}</span>
+            <span>${formatTimestamp(item.created_at)}</span>
+          </div>
+        </article>
+      `,
+    )
+    .join("");
+}
+
+function renderSafetyWorkspace(workspace) {
+  state.safety.workspace = workspace;
+  renderSafetyCaseList();
+  renderSafetyHero(workspace);
+  renderSafetySummaryCards(workspace);
+  renderSafetyOverview(workspace);
+  renderSafetyEvidence(workspace);
+  renderSafetyReview(workspace);
+  renderPlatformPages();
+}
+
+async function loadConsole() {
+  const payload = await fetchJson("/api/demo/console");
+  state.console = payload;
+  renderConsole(payload);
+}
+
+async function loadNeuroWorkspace(caseId = null) {
+  if (caseId) {
+    const workspace = await fetchJson(`/api/demo/cases/${caseId}`);
+    state.neuro.caseId = caseId;
+    renderNeuroWorkspace(workspace);
+    return;
+  }
+  const payload = await fetchJson("/api/demo/workspace");
+  state.neuro.caseId = payload.default_case_id;
+  state.neuro.cases = payload.cases;
+  renderNeuroWorkspace(payload.workspace);
+}
+
+async function loadFindingsWorkspace(caseId = null) {
+  if (caseId) {
+    const workspace = await fetchJson(`/api/findings/cases/${caseId}`);
+    state.findings.caseId = caseId;
+    renderFindingsWorkspace(workspace);
+    return;
+  }
+  const payload = await fetchJson("/api/findings/workspace");
+  state.findings.caseId = payload.default_case_id;
+  state.findings.cases = payload.cases;
+  state.findings.queueSummary = payload.queue_summary;
+  renderFindingsWorkspace(payload.workspace);
+}
+
+async function loadQueueWorkspace(caseId = null) {
+  if (caseId) {
+    const workspace = await fetchJson(`/api/queue/cases/${caseId}`);
+    state.queue.caseId = caseId;
+    renderQueueWorkspace(workspace);
+    return;
+  }
+  const payload = await fetchJson("/api/queue/workspace");
+  state.queue.caseId = payload.default_case_id;
+  state.queue.cases = payload.cases;
+  state.queue.queueSummary = payload.queue_summary;
+  renderQueueWorkspace(payload.workspace);
+}
+
+async function loadDiagnosisWorkspace(caseId = null) {
+  if (caseId) {
+    const workspace = await fetchJson(`/api/diagnosis/cases/${caseId}`);
+    state.diagnosis.caseId = caseId;
+    renderDiagnosisWorkspace(workspace);
+    return;
+  }
+  const payload = await fetchJson("/api/diagnosis/workspace");
+  state.diagnosis.caseId = payload.default_case_id;
+  state.diagnosis.cases = payload.cases;
+  state.diagnosis.queueSummary = payload.queue_summary;
+  renderDiagnosisWorkspace(payload.workspace);
+}
+
+async function loadScreeningWorkspace(caseId = null) {
+  if (caseId) {
+    const workspace = await fetchJson(`/api/screening/cases/${caseId}`);
+    state.screening.caseId = caseId;
+    renderScreeningWorkspace(workspace);
+    return;
+  }
+  const payload = await fetchJson("/api/screening/workspace");
+  state.screening.caseId = payload.default_case_id;
+  state.screening.cases = payload.cases;
+  state.screening.queueSummary = payload.queue_summary;
+  renderScreeningWorkspace(payload.workspace);
+}
+
+async function loadSafetyWorkspace(caseId = null) {
+  if (caseId) {
+    const workspace = await fetchJson(`/api/safety/cases/${caseId}`);
+    state.safety.caseId = caseId;
+    renderSafetyWorkspace(workspace);
+    return;
+  }
+  const payload = await fetchJson("/api/safety/workspace");
+  state.safety.caseId = payload.default_case_id;
+  state.safety.cases = payload.cases;
+  state.safety.queueSummary = payload.queue_summary;
+  renderSafetyWorkspace(payload.workspace);
+}
+
+async function handleGeneralCommand(event) {
+  event.preventDefault();
+  const input = document.getElementById("command-input");
+  const message = input.value.trim();
+  if (!message) {
+    return;
+  }
+  input.value = "";
+  state.homeMessages.push({ role: "user", content: message });
+  state.homeMessages.push(homeSystemMessage("Routing your request."));
+  renderHomeChat();
+  const pendingIndex = state.homeMessages.length - 1;
+  let latestRoute = null;
+  const routeCardPayload = {
+    workflow: { title: "Routing..." },
+    reason: "Choosing the most relevant workflow for this request.",
+    suggested_steps: [],
+    target_module: "home",
+  };
+  renderRouterCard(routeCardPayload);
+
+  await consumeSSE("/api/demo/execute-stream", { message }, (eventName, data) => {
+    if (eventName === "routed") {
+      const workflow = state.console.workflows.find((item) =>
+        item.id === data.workflow_id || item.module === data.target_module,
+      ) || { title: titleCase(data.target_module), tools: [] };
+      latestRoute = data;
+      renderRouterCard({
+        workflow,
+        reason: data.reason,
+        suggested_steps: workflow.tools || [],
+        target_module: data.target_module,
+        suggested_module: data.suggested_module,
+        confidence: data.confidence,
+        alternatives: data.alternatives || [],
+      });
+      state.homeMessages[pendingIndex] = {
+        role: "system",
+        content:
+          data.target_module === "home" && data.suggested_module
+            ? `${data.reason} Suggested workflow: ${workflow.title}.`
+            : `${workflow.title} selected. ${data.reason}`,
+      };
+      renderHomeChat();
+      return;
+    }
+
+    if (eventName === "queued" || eventName === "started" || eventName === "agent") {
+      const summary = summarizeAgentEvent(eventName, data, latestRoute || {});
+      if (!summary) {
+        return;
+      }
+      state.homeMessages[pendingIndex] = {
+        role: "system",
+        content: summary,
+      };
+      renderHomeChat();
+      return;
+    }
+
+    if (eventName === "done") {
+      state.homeMessages[pendingIndex] = {
+        role: "assistant",
+        content: data.result || "Execution completed.",
+      };
+      renderHomeChat();
+      return;
+    }
+
+    if (eventName === "error") {
+      state.homeMessages[pendingIndex] = {
+        role: "assistant",
+        content: `I ran into a problem while working on that request: ${data.error}`,
+      };
+      renderHomeChat();
+    }
+  });
+}
+
+async function handleNeuroChat(event) {
+  event.preventDefault();
+  const input = document.getElementById("chat-input");
+  const message = input.value.trim();
+  if (!message || !state.neuro.caseId) {
+    return;
+  }
+  input.value = "";
+  const payload = await fetchJson("/api/demo/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ case_id: state.neuro.caseId, message }),
+  });
+  renderNeuroWorkspace(payload.workspace);
+  setSubView("neuro", "analysis");
+}
+
+async function handleNeuroReview(action) {
+  const comment = document.getElementById("review-comment").value.trim();
+  const workspace = await fetchJson("/api/demo/review", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ case_id: state.neuro.caseId, action, comment }),
+  });
+  renderNeuroWorkspace(workspace);
+}
+
+async function handleUpload(files) {
+  if (!state.neuro.caseId || !files.length) {
+    return;
+  }
+  for (const file of files) {
+    const workspace = await fetchJson("/api/demo/upload", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ case_id: state.neuro.caseId, filename: file.name }),
+    });
+    renderNeuroWorkspace(workspace);
+  }
+}
+
+async function handleSafetyReview(action) {
+  const comment = document.getElementById("safety-review-comment").value.trim();
+  const workspace = await fetchJson("/api/safety/review", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ case_id: state.safety.caseId, action, comment }),
+  });
+  renderSafetyWorkspace(workspace);
+}
+
+async function rerunSafetyMatcher() {
+  const workspace = await fetchJson("/api/safety/rerun", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ case_id: state.safety.caseId }),
+  });
+  renderSafetyWorkspace(workspace);
+  setSubView("safety", "evidence");
+}
+
+function bindEvents() {
+  document.querySelectorAll("[data-page]").forEach((button) => {
+    button.addEventListener("click", () => setPage(button.dataset.page));
+  });
+  document.addEventListener("click", async (event) => {
+    const moduleButton = event.target.closest("[data-open-module]");
+    if (moduleButton) {
+      setPage(moduleButton.dataset.openModule);
+      return;
+    }
+    const neuroCaseButton = event.target.closest("[data-neuro-case-id]");
+    if (neuroCaseButton) {
+      await loadNeuroWorkspace(neuroCaseButton.dataset.neuroCaseId);
+      setPage("neuro");
+      return;
+    }
+    const safetyCaseButton = event.target.closest("[data-safety-case-id]");
+    if (safetyCaseButton) {
+      await loadSafetyWorkspace(safetyCaseButton.dataset.safetyCaseId);
+      setPage("safety");
+      return;
+    }
+    const findingsCaseButton = event.target.closest("[data-findings-case-id]");
+    if (findingsCaseButton) {
+      await loadFindingsWorkspace(findingsCaseButton.dataset.findingsCaseId);
+      setPage("findings");
+      return;
+    }
+    const queueCaseButton = event.target.closest("[data-queue-case-id]");
+    if (queueCaseButton) {
+      await loadQueueWorkspace(queueCaseButton.dataset.queueCaseId);
+      setPage("queue");
+      return;
+    }
+    const diagnosisCaseButton = event.target.closest("[data-diagnosis-case-id]");
+    if (diagnosisCaseButton) {
+      await loadDiagnosisWorkspace(diagnosisCaseButton.dataset.diagnosisCaseId);
+      setPage("diagnosis");
+      return;
+    }
+    const screeningCaseButton = event.target.closest("[data-screening-case-id]");
+    if (screeningCaseButton) {
+      await loadScreeningWorkspace(screeningCaseButton.dataset.screeningCaseId);
+      setPage("screening");
+      return;
+    }
+    const homePrompt = event.target.closest(".home-prompt");
+    if (homePrompt) {
+      document.getElementById("command-input").value = homePrompt.dataset.prompt;
+      document.getElementById("command-input").focus();
+      return;
+    }
+    const neuroPrompt = event.target.closest(".neuro-prompt");
+    if (neuroPrompt) {
+      document.getElementById("chat-input").value = neuroPrompt.dataset.prompt;
+      document.getElementById("chat-input").focus();
+      return;
+    }
+  });
+
+  document.getElementById("command-form").addEventListener("submit", handleGeneralCommand);
+  document.getElementById("chat-form").addEventListener("submit", handleNeuroChat);
+  document.getElementById("file-input").addEventListener("change", async (event) => {
+    await handleUpload(event.target.files);
+    event.target.value = "";
+  });
+  document.getElementById("neuro-case-select").addEventListener("change", async (event) => {
+    if (!event.target.value) {
+      return;
+    }
+    await loadNeuroWorkspace(event.target.value);
+  });
+  document.getElementById("neuro-viewer-timepoint-select").addEventListener("change", async (event) => {
+    if (!state.neuro.workspace || !state.neuro.workspace.imaging_preview) {
+      return;
+    }
+    state.neuro.viewer.activeIndex = Number(event.target.value || 0);
+    await renderNeuroViewer(state.neuro.workspace);
+  });
+  document.querySelectorAll("[data-review-action]").forEach((button) => {
+    button.addEventListener("click", () => handleNeuroReview(button.dataset.reviewAction));
+  });
+  document.querySelectorAll("[data-safety-review-action]").forEach((button) => {
+    button.addEventListener("click", () => handleSafetyReview(button.dataset.safetyReviewAction));
+  });
+  document.getElementById("rerun-button").addEventListener("click", rerunSafetyMatcher);
+  document.querySelectorAll("[data-neuro-view]").forEach((button) => {
+    button.addEventListener("click", () => setSubView("neuro", button.dataset.neuroView));
+  });
+  document.querySelectorAll("[data-safety-view]").forEach((button) => {
+    button.addEventListener("click", () => setSubView("safety", button.dataset.safetyView));
+  });
+}
+
+window.addEventListener("DOMContentLoaded", async () => {
+  try {
+    bindEvents();
+    state.homeMessages = [
+      {
+        role: "system",
+        content:
+          "Start with a clinical request. ClinAgent will route it, review the relevant context, and open the right workspace when needed.",
+      },
+    ];
+    renderHomeChat();
+    renderRouterCard();
+    await Promise.all([
+      loadConsole(),
+      loadNeuroWorkspace(),
+      loadSafetyWorkspace(),
+      loadQueueWorkspace(),
+      loadDiagnosisWorkspace(),
+      loadScreeningWorkspace(),
+    ]);
+    await loadFindingsWorkspace();
+    setPage("home");
+    setSubView("neuro", "analysis");
+    setSubView("safety", "overview");
+  } catch (error) {
+    console.error("ClinAgent demo failed to initialize", error);
+    state.homeMessages = [
+      {
+        role: "assistant",
+        content: `The demo did not finish loading: ${error?.message || error}. Try a hard refresh once. If it still fails, the page is now surfacing the real initialization error instead of staying on Loading.`,
+      },
+    ];
+    renderHomeChat();
+    renderRouterCard({
+      workflow: { title: "Loading issue" },
+      reason: error?.message || "The demo failed to initialize.",
+      target_module: "home",
+      alternatives: [],
+    });
+  }
+});

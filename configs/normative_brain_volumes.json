@@ -1,0 +1,30 @@
+{
+  "_meta": {
+    "note": "Research-use reference table generated from reviewed master records. Published entries are intended for comparative volumetry only and are not a clinical normative database.",
+    "source_alignment": "Official label naming derived from https://huggingface.co/nvidia/NV-Segment-CTMR/blob/main/metadata.json",
+    "units": "mm3",
+    "generated_from": "configs/normative_brain_volumes_master.csv",
+    "generated_on": "2026-04-10",
+    "selection_criteria": {
+      "minimum_evidence_tier": "Tier A",
+      "required_review_status": "approved",
+      "minimum_sample_size": 100,
+      "allowed_label_definition_match": [
+        "exact",
+        "approximate",
+        "group-only"
+      ],
+      "excluded_source_types": [
+        "vendor_db"
+      ]
+    },
+    "normalization_limits": [
+      "ROI volumetry does not require spatial normalization to template space when the segmentation pipeline is consistent.",
+      "Age, sex, and intracranial-volume effects are incompletely modeled in literature-derived references unless explicitly noted.",
+      "Cross-scanner and cross-site shifts can alter measured volumes; use cohort-specific harmonization before clinical deployment."
+    ],
+    "candidate_record_count": 120,
+    "published_record_count": 0,
+    "published_region_count": 0
+  }
+}
